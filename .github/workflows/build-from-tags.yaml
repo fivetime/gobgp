@@ -1,0 +1,140 @@
+name: "Build image from tags"
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag to build (e.g. v4.6.0). Empty = newest stable tag.'
+        required: false
+        default: ''
+      platforms:
+        description: 'Which platforms to build'
+        required: false
+        default: all
+        type: choice
+        options: [all, amd64, arm64, armv7, '386', amd64+arm64]
+  schedule:
+    - cron: '0 6 * * *'         # 比 sync(5:00) 晚 1 小时；版本未变则幂等跳过
+  workflow_run:
+    workflows: ["Sync from upstream"]   # 上游同步成功后自动触发
+    types: [completed]
+
+concurrency:
+  group: build-from-tags
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  build:
+    # 定时/手动总是构建；由 sync 触发时，仅在 sync 成功后构建。
+    if: ${{ github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success' }}
+    runs-on: ubuntu-latest      # 如有自建 runner 可改为 self-hosted
+    steps:
+      - name: Check out master (with tags)
+        uses: actions/checkout@v5
+        with:
+          ref: master
+          fetch-depth: 0
+
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Resolve tag / platforms / decide skip
+        id: prep
+        run: |
+          set -euo pipefail
+          image="${REGISTRY}/${GITHUB_REPOSITORY,,}"
+
+          tag="${{ inputs.tag }}"
+          if [ -z "$tag" ]; then
+            # 取最高的正式 release tag（vX.Y.Z），排除预发布。
+            tag="$(git tag -l 'v*' \
+                   | grep -E '^v[0-9]+\.[0-9]+(\.[0-9]+)?$' \
+                   | sort -V | tail -1)"
+          fi
+          if [ -z "$tag" ]; then
+            echo "::error::No release tag (vX.Y.Z) found. Run 'Sync from upstream' first." >&2
+            exit 1
+          fi
+
+          # 幂等：该版本已发布则跳过（手动 dispatch 例外，强制重建）。
+          skip=false
+          if [ "${{ github.event_name }}" != "workflow_dispatch" ] \
+             && docker manifest inspect "${image}:${tag}" >/dev/null 2>&1; then
+            echo "::notice::${image}:${tag} already published — skipping."
+            skip=true
+          fi
+
+          p="${{ inputs.platforms }}"
+          [ -z "$p" ] && p=all
+          case "$p" in
+            all)         plats="linux/amd64,linux/arm64,linux/arm/v7,linux/386" ;;
+            amd64)       plats="linux/amd64" ;;
+            arm64)       plats="linux/arm64" ;;
+            armv7)       plats="linux/arm/v7" ;;
+            386)         plats="linux/386" ;;
+            amd64+arm64) plats="linux/amd64,linux/arm64" ;;
+            *) echo "::error::unknown platforms input: $p"; exit 1 ;;
+          esac
+
+          { echo "image=$image"; echo "tag=$tag"; echo "platforms=$plats"; echo "skip=$skip"; } >> "$GITHUB_OUTPUT"
+          echo "tag=$tag skip=$skip platforms=$plats"
+
+      # 切到 release tag 取上游源码，记录该 tag 的提交 sha 与日期供 ldflags 用；
+      # 再把本 fork 自定义的 docker/（Alpine Dockerfile）从 master 叠加上去——
+      # 上游 tag 里没有它。
+      - name: Checkout release source, overlay docker/ from master
+        if: steps.prep.outputs.skip != 'true'
+        id: src
+        run: |
+          set -eux
+          git checkout "${{ steps.prep.outputs.tag }}"
+          echo "commit=$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y%m%d)" >> "$GITHUB_OUTPUT"
+          git checkout master -- docker .dockerignore
+
+      - name: Set up QEMU
+        if: steps.prep.outputs.skip != 'true'
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        if: steps.prep.outputs.skip != 'true'
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push (multi-arch)
+        if: steps.prep.outputs.skip != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./docker/Dockerfile
+          platforms: ${{ steps.prep.outputs.platforms }}
+          push: true
+          provenance: false
+          sbom: false
+          build-args: |
+            VERSION=${{ steps.prep.outputs.tag }}
+            COMMIT=${{ steps.src.outputs.commit }}
+            DATE=${{ steps.src.outputs.date }}
+          # :<tag> 固定版本 + :latest 永远指向最新 release。
+          tags: |
+            ${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.tag }}
+            ${{ steps.prep.outputs.image }}:latest
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.prep.outputs.tag }}
+          cache-from: type=gha,scope=release
+          cache-to: type=gha,mode=max,scope=release
+
+      - name: Inspect
+        if: steps.prep.outputs.skip != 'true'
+        run: docker buildx imagetools inspect ${{ steps.prep.outputs.image }}:${{ steps.prep.outputs.tag }}

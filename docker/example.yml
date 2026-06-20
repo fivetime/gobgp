@@ -1,0 +1,72 @@
+# Minimal Kubernetes example for the Alpine GoBGP image built from
+# docker/Dockerfile. A ConfigMap holds the gobgpd TOML config; the Deployment
+# runs gobgpd with `-f` pointing at the mounted config.
+#
+# Notes:
+#   - hostNetwork is used so gobgpd can bind BGP port 179 and peer with routers
+#     reachable from the node. Drop it (and add a Service) if you only need the
+#     gRPC API and peer over the pod network.
+#   - The image ENTRYPOINT is `gobgpd`; `args` are appended to it.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: gobgpd-config
+  namespace: default
+data:
+  gobgpd.toml: |
+    [global.config]
+      as = 65001
+      router-id = "10.0.0.1"
+
+    [[neighbors]]
+      [neighbors.config]
+        peer-as = 65002
+        neighbor-address = "10.0.0.2"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gobgpd
+  namespace: default
+  labels:
+    app: gobgpd
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gobgpd
+  template:
+    metadata:
+      labels:
+        app: gobgpd
+    spec:
+      hostNetwork: true
+      dnsPolicy: ClusterFirstWithHostNet
+      containers:
+        - name: gobgpd
+          image: ghcr.io/fivetime/gobgp:latest
+          imagePullPolicy: IfNotPresent
+          args:
+            - -f
+            - /etc/gobgp/gobgpd.toml
+            - --api-hosts
+            - "0.0.0.0:50051"
+          ports:
+            - name: bgp
+              containerPort: 179
+              protocol: TCP
+            - name: grpc-api
+              containerPort: 50051
+              protocol: TCP
+          securityContext:
+            capabilities:
+              add: ["NET_BIND_SERVICE", "NET_ADMIN"]
+          volumeMounts:
+            - name: config
+              mountPath: /etc/gobgp
+              readOnly: true
+      volumes:
+        - name: config
+          configMap:
+            name: gobgpd-config

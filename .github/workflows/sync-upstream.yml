@@ -1,0 +1,93 @@
+name: Sync from upstream
+
+on:
+  schedule:
+    - cron: "0 5 * * *"
+  workflow_dispatch:
+
+# Avoid two runs racing on the push to origin.
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  UPSTREAM: https://github.com/osrg/gobgp.git
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          # GITHUB_TOKEN cannot push commits/tags that touch workflow files,
+          # which upstream changes routinely do. SYNC_PAT is a PAT with the
+          # 'workflow' scope.
+          token: ${{ secrets.SYNC_PAT }}
+
+      - name: Configure git identity
+        run: |
+          git config user.name  "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM"
+          git fetch upstream --tags --prune
+
+      - name: Sync master
+        run: |
+          # Fast-forward when possible; otherwise merge so fork-local commits
+          # (our docker/ + workflow customizations, plus local bgp fixes)
+          # survive. Abort on conflict so a broken merge never lands on origin.
+          if git merge --ff-only upstream/master; then
+            echo "Fast-forwarded master."
+          else
+            echo "Fork master has diverged; merging upstream/master."
+            if ! git merge upstream/master --no-edit -m "Sync upstream master"; then
+              echo "::error::merge conflict on master -- resolve manually"
+              git merge --abort
+              exit 1
+            fi
+          fi
+          git push origin master
+
+      - name: Push tags
+        id: push_tags
+        run: |
+          # Capture which tags are newly pushed -- the plain git push output
+          # marks them with "[new tag]" lines. Existing tags are not
+          # overwritten (no --force).
+          tmp=$(mktemp)
+          git push origin --tags 2>&1 | tee "$tmp"
+          new_tags=$(grep -oE '\[new tag\][[:space:]]+\S+' "$tmp" | awk '{print $NF}' | tr '\n' ' ')
+          echo "Newly pushed tags: ${new_tags:-(none)}"
+          echo "new_tags=${new_tags}" >> "$GITHUB_OUTPUT"
+
+      - name: Dispatch build-from-tags.yaml for new v* tags
+        if: steps.push_tags.outputs.new_tags != ''
+        env:
+          # workflow_dispatch via API requires a PAT -- GITHUB_TOKEN cannot
+          # trigger other workflows.
+          GH_TOKEN: ${{ secrets.SYNC_PAT }}
+        run: |
+          # Plain tag push events would use the workflow file at the tag
+          # commit, which predates this fork's customizations. Dispatching
+          # from master makes the build use the current workflow definition
+          # while checking out the tag's code (via the `tag` input).
+          # Same stable-release rule as build-from-tags.yaml (vX.Y[.Z], no
+          # prereleases like v3.0.0-rc1) so the two workflows agree on what
+          # gets an image built.
+          for tag in ${{ steps.push_tags.outputs.new_tags }}; do
+            if echo "$tag" | grep -qE '^v[0-9]+\.[0-9]+(\.[0-9]+)?$'; then
+              echo "Dispatching build-from-tags.yaml for ${tag}"
+              gh workflow run build-from-tags.yaml --ref master -f "tag=${tag}" \
+                --repo "${{ github.repository }}" \
+                || echo "::warning::dispatch failed for ${tag}"
+            else
+              echo "Skipping non-stable tag: ${tag}"
+            fi
+          done
