@@ -1,0 +1,11 @@
+# Keep the build context small. The Dockerfile only needs Go sources + go.mod.
+.git
+.github
+*.md
+docs
+docker
+test
+tests
+.goreleaser.yml
+.gitignore
+.dockerignore
