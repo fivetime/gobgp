@@ -36,9 +36,10 @@ type bfdServerStats struct {
 }
 
 type bfdEventPeerUpdate struct {
-	isAdd       bool
-	peerAddress netip.Addr
-	config      oc.BfdConfig
+	isAdd         bool
+	peerAddress   netip.Addr
+	config        oc.BfdConfig
+	bindInterface string
 }
 
 type bfdPeerState struct {
@@ -64,7 +65,8 @@ type bfdServer struct {
 	// can run BFD on a host that also runs a system bfdd. Empty → wildcard bind.
 	listenAddrs []string
 
-	udpServers []*net.UDPConn
+	udpServers      []*net.UDPConn
+	listenInterface string
 
 	peersMutex sync.RWMutex
 	peers      map[netip.Addr]*bfdPeer
@@ -102,14 +104,10 @@ func NewBfdServer(ps peerState, logger *slog.Logger) *bfdServer {
 	return s
 }
 
-func (s *bfdServer) Start(ctx context.Context, config oc.BfdConfig, listenAddrs ...string) error {
+func (s *bfdServer) Start(ctx context.Context, config oc.BfdConfig) error {
 	if s.stopped.Load() {
 		return errors.New("bfd server stopped")
 	}
-
-	// Set before the channel send so it is visible (happens-before) to the
-	// serverLoop goroutine that reads it in startServer.
-	s.listenAddrs = listenAddrs
 
 	select {
 	case s.eventConfig <- &config:
@@ -133,7 +131,7 @@ func (s *bfdServer) Stop() {
 	})
 }
 
-func (s *bfdServer) AddPeer(ctx context.Context, peerAddress netip.Addr, config oc.BfdConfig) error {
+func (s *bfdServer) AddPeer(ctx context.Context, peerAddress netip.Addr, config oc.BfdConfig, bindInterface string) error {
 	if s.stopped.Load() {
 		return errors.New("bfd server stopped")
 	}
@@ -143,7 +141,7 @@ func (s *bfdServer) AddPeer(ctx context.Context, peerAddress netip.Addr, config 
 	}
 
 	select {
-	case s.eventPeerUpdate <- &bfdEventPeerUpdate{isAdd: true, peerAddress: peerAddress, config: config}:
+	case s.eventPeerUpdate <- &bfdEventPeerUpdate{isAdd: true, peerAddress: peerAddress, config: config, bindInterface: bindInterface}:
 		if s.stopped.Load() {
 			return errors.New("bfd server stopped")
 		}
@@ -222,7 +220,7 @@ func (s *bfdServer) loop() {
 			s.config = ev
 		case ev := <-s.eventPeerUpdate:
 			if ev.isAdd {
-				s.addBfdPeer(ev.peerAddress, ev.config)
+				s.addBfdPeer(ev.peerAddress, ev.config, ev.bindInterface)
 			} else {
 				s.deleteBfdPeer(ev.peerAddress)
 			}
@@ -253,13 +251,20 @@ func (s *bfdServer) startServer() {
 	// multihop control port (RFC 5883/4784), so the server receives returns from
 	// both single-hop and multihop peers. rxPacket dispatches by source IP, so it
 	// does not matter which socket a packet arrived on.
-	ports := []uint16{uint16(s.config.Port)}
-	if uint16(s.config.Port) != bfdMultihopPort {
+	ports := []uint16{s.config.Port}
+	if s.config.Port != bfdMultihopPort {
 		ports = append(ports, bfdMultihopPort)
 	}
 
 	var lc net.ListenConfig
 	lc.Control = func(network, address string, sc syscall.RawConn) error {
+		if s.listenInterface != "" {
+			s.logger.Info("binding bfd listener to interface", slog.String("interface", s.listenInterface))
+			if err := netutils.SetBindToDevSockopt(sc, s.listenInterface); err != nil {
+				return err
+			}
+		}
+
 		return netutils.SetReuseAddrSockopt(sc)
 	}
 
@@ -325,7 +330,7 @@ func (s *bfdServer) stop() {
 	)
 }
 
-func (s *bfdServer) addBfdPeer(peerAddress netip.Addr, config oc.BfdConfig) {
+func (s *bfdServer) addBfdPeer(peerAddress netip.Addr, config oc.BfdConfig, bindInterface string) {
 	s.peersMutex.RLock()
 	_, ok := s.peers[peerAddress]
 	s.peersMutex.RUnlock()
@@ -339,7 +344,7 @@ func (s *bfdServer) addBfdPeer(peerAddress netip.Addr, config oc.BfdConfig) {
 		return
 	}
 
-	bfdPeer := NewBfdPeer(s.peerState, s.logger, peerAddress, config)
+	bfdPeer := NewBfdPeer(s.peerState, s.logger, peerAddress, config, bindInterface)
 	if bfdPeer != nil {
 		s.logger.Info("Insert BFD peer",
 			slog.String("Topic", "bfd"),
