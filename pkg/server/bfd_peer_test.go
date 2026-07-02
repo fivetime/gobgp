@@ -172,6 +172,50 @@ func Test_RxPacketRFCStateTransitions(t *testing.T) {
 	assert.Equal(uint32(444), p.yourDiscriminator)
 }
 
+// Test_RxPacketDetectionTimeFromRemote pins RFC 5880 §6.8.4: the detection time
+// must be the REMOTE's Detect Mult × max(local RequiredMinRx, remote DesiredMinTx),
+// not our own multiplier × our own rxInterval. Regression guard for the multihop
+// ctrl-tap "BFD is down" false-positive: local rx=300ms/mult=3 (=900ms) receiving
+// a peer that advertises tx=1000ms would expire ~100ms before every packet and
+// flap. After the fix the detector stretches to 3×1000ms=3000ms.
+func Test_RxPacketDetectionTimeFromRemote(t *testing.T) {
+	assert := assert.New(t)
+
+	ps := &mockPeerState{}
+	p := NewBfdPeer(ps, slog.Default(), netip.MustParseAddr("127.0.0.1"), oc.BfdConfig{
+		Port:                     13784,
+		Enabled:                  true,
+		DetectionMultiplier:      3,
+		RequiredMinimumReceive:   300000, // 300ms
+		DesiredMinimumTxInterval: 300000,
+	}, "")
+	defer p.Stop()
+
+	// Before any packet: our-config-only baseline (the old, buggy value).
+	assert.Equal(3*300*time.Millisecond, p.expiryInterval)
+
+	// Peer advertises a SLOWER cadence (BIRD default on the tap): tx=1000ms, mult=3.
+	p.rxPacket(&bfd.BFDHeader{
+		State:                 bfd.StateDown,
+		MyDiscriminator:       111,
+		YourDiscriminator:     p.myDiscriminator,
+		DesiredMinTxInterval:  1000000, // 1000ms
+		DetectTimeMultiplier:  3,
+		RequiredMinRxInterval: 1000000,
+	})
+	// Detection must now track the peer: 3 × max(300ms, 1000ms) = 3000ms > 1000ms.
+	assert.Equal(3*1000*time.Millisecond, p.expiryInterval)
+
+	// A zero-timer keepalive must NOT collapse the detector back to a bogus value:
+	// missing remote fields fall back to our local config, not to 0.
+	p.rxPacket(&bfd.BFDHeader{
+		State:             bfd.StateUp,
+		MyDiscriminator:   111,
+		YourDiscriminator: p.myDiscriminator,
+	})
+	assert.Equal(3*300*time.Millisecond, p.expiryInterval)
+}
+
 func Test_TxPacket(t *testing.T) {
 	assert := assert.New(t)
 

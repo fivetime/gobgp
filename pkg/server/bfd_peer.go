@@ -291,7 +291,24 @@ func (p *bfdPeer) rxPacket(h *bfd.BFDHeader) {
 
 	p.stats.rxPacket.Add(1)
 
-	// NOTE: remote DesiredMinTxInterval and RequiredMinRxInterval ignored
+	// RFC 5880 §6.8.4: the Detection Time is the REMOTE system's Detect Mult
+	// multiplied by the *negotiated* receive interval — the greater of our
+	// bfd.RequiredMinRxInterval and the remote's last advertised Desired Min TX
+	// Interval. Deriving it from our own multiplier × our own rxInterval (and
+	// ignoring what the peer advertises) breaks whenever the peer transmits
+	// SLOWER than we would: e.g. BIRD tx=1000ms vs our rx=300ms×3=900ms detection
+	// → we expire ~100ms before every packet and flap the session down/up (the
+	// "BFD is down" false-positive seen on the multihop ctrl-tap). Recompute per
+	// packet so the detector tracks the peer's actual (re-)negotiated cadence.
+	negotiatedRx := p.rxInterval
+	if remoteTx := time.Duration(h.DesiredMinTxInterval) * time.Microsecond; remoteTx > negotiatedRx {
+		negotiatedRx = remoteTx
+	}
+	remoteMult := time.Duration(h.DetectTimeMultiplier)
+	if remoteMult == 0 {
+		remoteMult = time.Duration(p.multiplier)
+	}
+	p.expiryInterval = remoteMult * negotiatedRx
 
 	switch h.State {
 	case bfd.StateAdminDown:
