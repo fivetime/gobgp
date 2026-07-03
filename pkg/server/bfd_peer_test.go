@@ -216,6 +216,22 @@ func Test_RxPacketDetectionTimeFromRemote(t *testing.T) {
 	assert.Equal(3*300*time.Millisecond, p.expiryInterval)
 }
 
+func Test_ExpiryDoesNotResetAlreadyDownPeer(t *testing.T) {
+	assert := assert.New(t)
+
+	ps := &mockPeerState{}
+	p := NewBfdPeer(ps, slog.Default(), netip.MustParseAddr("127.0.0.1"), oc.BfdConfig{
+		Port:    13784,
+		Enabled: true,
+	}, "")
+	defer p.Stop()
+
+	p.setStateDown()
+	p.expiry()
+
+	assert.Equal(int64(0), atomic.LoadInt64(&ps.resetPeerCount))
+}
+
 func Test_TxPacket(t *testing.T) {
 	assert := assert.New(t)
 

@@ -355,6 +355,11 @@ func (p *bfdPeer) tx() {
 }
 
 func (p *bfdPeer) expiry() {
+	if p.sessionState() == api.BfdSessionState_BFD_SESSION_STATE_DOWN {
+		p.eventExpiry.Stop()
+		return
+	}
+
 	p.logger.Warn("Expired",
 		slog.String("Topic", "bfd"),
 		slog.String("Peer", p.peerAddress.String()),
