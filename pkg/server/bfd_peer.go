@@ -320,7 +320,7 @@ func (p *bfdPeer) rxPacket(h *bfd.BFDHeader) {
 		case api.BfdSessionState_BFD_SESSION_STATE_DOWN:
 			p.setStateInit(h.MyDiscriminator)
 		case api.BfdSessionState_BFD_SESSION_STATE_UP:
-			p.remoteDown()
+			p.remoteReinit(h.MyDiscriminator)
 		}
 	case bfd.StateInit:
 		switch p.sessionState() {
@@ -386,6 +386,30 @@ func (p *bfdPeer) remoteDown() {
 
 	p.resetPeer()
 	p.setStateDown()
+}
+
+// remoteReinit handles a State Down received while we are Up: the remote is
+// RE-INITIALIZING its BFD session (RFC 5880 §6.2 — a peer that lost its session,
+// e.g. a restarted BIRD tap, begins in Down and announces Down), which is NOT a
+// path failure. We re-enter the handshake (Init, seeding the remote's new
+// discriminator) and — because the session is now Init — rxPacket re-arms the
+// detection timer, so a peer that dies mid-reinit is still caught fast by
+// expiry(). Crucially we do NOT resetPeer(): a RECEIVED packet proves the path
+// is alive, so for a liveness sensor (the SBW coverer, whose DEATH_VOTE keys on
+// BGP PeerDown) the edge is demonstrably not dead. Issuing a CEASE/RST here
+// races the peer's reconnect and — because BIRD couples its BFD session lifetime
+// to the BGP session — makes BIRD tear down and re-announce Down, which resets
+// us again: a self-sustaining flap that held a live edge falsely dead for
+// minutes (observed ~11m on the multihop ctrl-tap after a bird restart). Genuine
+// peer loss STOPS the packet flow entirely and is caught by expiry() (detection
+// timeout), which DOES hard-reset BGP for fast failover.
+func (p *bfdPeer) remoteReinit(yourDiscriminator uint32) {
+	p.logger.Info("Remote BFD re-initializing (Down while Up); re-handshaking, BGP held up",
+		slog.String("Topic", "bfd"),
+		slog.String("Peer", p.peerAddress.String()),
+	)
+
+	p.setStateInit(yourDiscriminator)
 }
 
 func (p *bfdPeer) resetPeer() {

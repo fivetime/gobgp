@@ -107,7 +107,15 @@ func Test_RxPacket(t *testing.T) {
 	assert.NotEqual(p.stats.rxPacket.Load(), uint64(0))
 }
 
-func Test_RxPacketRemoteDownResetsPeer(t *testing.T) {
+// Test_RxPacketRemoteReinitDoesNotResetPeer pins the anti-flap fix: a State Down
+// received while we are Up means the remote is RE-INITIALIZING its BFD session
+// (RFC 5880 §6.2 — a restarted BIRD tap begins in Down and announces Down), not
+// a path failure. Because we still RECEIVED a packet the path is alive, so for a
+// liveness sensor we must re-handshake (→ Init, seeding the remote's new
+// discriminator) WITHOUT hard-resetting the BGP peer. Hard-resetting here raced
+// the peer's reconnect and — BIRD couples its BFD session to the BGP session —
+// self-sustained a flap that held a live edge falsely dead for minutes.
+func Test_RxPacketRemoteReinitDoesNotResetPeer(t *testing.T) {
 	assert := assert.New(t)
 
 	ps := &mockPeerState{}
@@ -125,6 +133,37 @@ func Test_RxPacketRemoteDownResetsPeer(t *testing.T) {
 
 	p.rxPacket(&bfd.BFDHeader{
 		State:             bfd.StateDown,
+		MyDiscriminator:   67890,
+		YourDiscriminator: p.myDiscriminator,
+	})
+
+	// Re-handshake, not teardown: session → Init, remote's new discriminator
+	// seeded, and — crucially — NO BGP reset (the edge is demonstrably alive).
+	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_INIT, api.BfdSessionState(p.state.Load()))
+	assert.Equal(uint32(67890), p.yourDiscriminator)
+	assert.Equal(int64(0), atomic.LoadInt64(&ps.resetPeerCount))
+}
+
+// Test_RxPacketAdminDownStillResetsPeer locks that a DELIBERATE remote teardown
+// (AdminDown) still hard-resets BGP — only the transient re-init Down is spared.
+func Test_RxPacketAdminDownStillResetsPeer(t *testing.T) {
+	assert := assert.New(t)
+
+	ps := &mockPeerState{}
+	p := NewBfdPeer(ps, slog.Default(), netip.MustParseAddr("127.0.0.1"), oc.BfdConfig{
+		Port:                     13784,
+		Enabled:                  true,
+		DetectionMultiplier:      5,
+		RequiredMinimumReceive:   200000,
+		DesiredMinimumTxInterval: 200000,
+	}, "")
+	defer p.Stop()
+
+	p.state.Store(int32(api.BfdSessionState_BFD_SESSION_STATE_UP))
+	p.yourDiscriminator = 12345
+
+	p.rxPacket(&bfd.BFDHeader{
+		State:             bfd.StateAdminDown,
 		MyDiscriminator:   67890,
 		YourDiscriminator: p.myDiscriminator,
 	})
