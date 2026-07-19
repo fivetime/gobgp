@@ -542,6 +542,29 @@ func Test_FlowSpecNlri(t *testing.T) {
 	assert.Equal(n1, n2)
 }
 
+func Test_FlowSpecNlriComponentsClampedToDeclaredLength(t *testing.T) {
+	assert := assert.New(t)
+	item := NewFlowSpecComponentItem(DEC_NUM_OP_EQ, 6)
+	comp := NewFlowSpecComponent(FLOW_SPEC_TYPE_IP_PROTO, []*FlowSpecComponentItem{item})
+	n1, err := NewFlowSpecUnicast(RF_FS_IPv4_UC, []FlowSpecComponentInterface{comp})
+	assert.NoError(err)
+	one, err := n1.Serialize()
+	assert.NoError(err)
+	declared := int(one[0])
+
+	// Declare one byte fewer than the component occupies, then append a byte
+	// that belongs to the next NLRI. The component must not reach past the
+	// declared length into that following byte.
+	buf := make([]byte, len(one))
+	copy(buf, one)
+	buf[0] = byte(declared - 1)
+	buf = append(buf, 0xEE)
+
+	nlri, err := NLRIFromSlice(RF_FS_IPv4_UC, buf)
+	assert.NoError(err)
+	assert.LessOrEqual(nlri.Len(), 1+(declared-1))
+}
+
 func Test_NewFlowSpecComponentItemLength(t *testing.T) {
 	item := NewFlowSpecComponentItem(0, 0)
 	assert.Equal(t, 1, item.Len())
@@ -813,6 +836,48 @@ func Test_EVPNIPPrefixRoute(t *testing.T) {
 	assert.NoError(err)
 
 	assert.Equal(n1, n2)
+}
+
+func Test_EVPNIPPrefixRouteRejectsOversizedPrefixLength(t *testing.T) {
+	assert := assert.New(t)
+	rd, _ := ParseRouteDistinguisher("100:100")
+	esi := EthernetSegmentIdentifier{Type: ESI_ARBITRARY, Value: make([]byte, 9)}
+
+	v4 := NewEVPNNLRI(EVPN_IP_PREFIX, &EVPNIPPrefixRoute{
+		RD:             rd,
+		ESI:            esi,
+		ETag:           10,
+		IPPrefixLength: 24,
+		IPPrefix:       netip.AddrFrom4([4]byte{10, 10, 10, 0}),
+		GWIPAddress:    netip.AddrFrom4([4]byte{10, 10, 10, 10}),
+		Label:          1000,
+	})
+	buf, err := v4.Serialize()
+	assert.NoError(err)
+	// Wire layout: RouteType(1) + Length(1) + RD(8) + ESI(10) + ETag(4)
+	// + IPPrefixLength(1) ..., so the length octet is at index 24.
+	const plOffset = 2 + 22
+	buf[plOffset] = 33 // /33 cannot exist for an IPv4 EVPN prefix
+	_, err = NLRIFromSlice(RF_EVPN, buf)
+	assert.Error(err)
+	buf[plOffset] = 24 // a legal length still decodes
+	_, err = NLRIFromSlice(RF_EVPN, buf)
+	assert.NoError(err)
+
+	v6 := NewEVPNNLRI(EVPN_IP_PREFIX, &EVPNIPPrefixRoute{
+		RD:             rd,
+		ESI:            esi,
+		ETag:           10,
+		IPPrefixLength: 64,
+		IPPrefix:       netip.MustParseAddr("2001:db8::"),
+		GWIPAddress:    netip.MustParseAddr("2001:db8::1"),
+		Label:          1000,
+	})
+	buf6, err := v6.Serialize()
+	assert.NoError(err)
+	buf6[plOffset] = 129 // /129 cannot exist for an IPv6 EVPN prefix
+	_, err = NLRIFromSlice(RF_EVPN, buf6)
+	assert.Error(err)
 }
 
 func Test_EVPNMacIPAdvertisementRoute(t *testing.T) {
