@@ -16,8 +16,10 @@
 package oc
 
 import (
+	"encoding/base64"
 	"fmt"
 	"net"
+	"net/netip"
 	"path/filepath"
 	"regexp"
 	"slices"
@@ -224,19 +226,25 @@ func (n *Neighbor) NeedsResendOpenMessage(new *Neighbor) bool {
 		!n.GracefulRestart.Config.Equal(&new.GracefulRestart.Config) ||
 		isAfiSafiChanged(n.AfiSafis, new.AfiSafis) ||
 		!n.EbgpMultihop.Config.Equal(&new.EbgpMultihop.Config) ||
-		!n.TtlSecurity.Config.Equal(&new.TtlSecurity.Config)
+		!n.TtlSecurity.Config.Equal(&new.TtlSecurity.Config) ||
+		n.TcpAo.Config.Keychain != new.TcpAo.Config.Keychain
 }
 
 // TODO: these regexp are duplicated in api
 var _regexpPrefixMaskLengthRange = regexp.MustCompile(`(\d+)\.\.(\d+)`)
 
 func ParseMaskLength(prefix, mask string) (int, int, error) {
-	_, ipNet, err := net.ParseCIDR(prefix)
+	p, err := netip.ParsePrefix(prefix)
+	var rf bgp.Family
 	if err != nil {
-		return 0, 0, fmt.Errorf("invalid prefix: %s", prefix)
+		p, err = bgp.ParseRTCPrefix(prefix)
+		if err != nil {
+			return 0, 0, fmt.Errorf("invalid prefix: %s", prefix)
+		}
+		rf = bgp.RF_RTC_UC
 	}
 	if mask == "" {
-		l, _ := ipNet.Mask.Size()
+		l := p.Bits()
 		return l, l, nil
 	}
 	elems := _regexpPrefixMaskLengthRange.FindStringSubmatch(mask)
@@ -249,22 +257,45 @@ func ParseMaskLength(prefix, mask string) (int, int, error) {
 	if min > max {
 		return 0, 0, fmt.Errorf("invalid mask length range: %s", mask)
 	}
-	if ipv4 := ipNet.IP.To4(); ipv4 != nil {
+	if rf == bgp.RF_RTC_UC {
 		f := func(i uint64) bool {
-			return i <= 32
+			return i <= bgp.RouteTargetMembershipPrefixLen
 		}
 		if !f(min) || !f(max) {
-			return 0, 0, fmt.Errorf("ipv4 mask length range outside scope :%s", mask)
+			return 0, 0, fmt.Errorf("rtc mask length range outside scope :%s", mask)
 		}
 	} else {
 		f := func(i uint64) bool {
-			return i <= 128
+			return i <= uint64(p.Addr().BitLen())
 		}
 		if !f(min) || !f(max) {
-			return 0, 0, fmt.Errorf("ipv6 mask length range outside scope :%s", mask)
+			return 0, 0, fmt.Errorf("ip mask length range outside scope :%s", mask)
 		}
 	}
 	return int(min), int(max), nil
+}
+
+// ToPrefix parses the ip-prefix or rtc-prefix field (mutually exclusive) into a netip.Prefix and family.
+func (c *Prefix) ToPrefix() (netip.Prefix, bgp.Family, error) {
+	if c.IpPrefix.IsValid() && c.RtcPrefix != "" {
+		return netip.Prefix{}, 0, fmt.Errorf("ip-prefix and rtc-prefix are mutually exclusive")
+	}
+	switch {
+	case c.IpPrefix.IsValid():
+		rf := bgp.RF_IPv4_UC
+		if c.IpPrefix.Addr().Is6() {
+			rf = bgp.RF_IPv6_UC
+		}
+		return c.IpPrefix, rf, nil
+	case c.RtcPrefix != "":
+		pfx, err := bgp.ParseRTCPrefix(c.RtcPrefix)
+		if err != nil {
+			return netip.Prefix{}, 0, err
+		}
+		return pfx, bgp.RF_RTC_UC, nil
+	default:
+		return netip.Prefix{}, 0, fmt.Errorf("prefix requires ip-prefix or rtc-prefix")
+	}
 }
 
 func extractFamilyFromConfigAfiSafi(c *AfiSafi) uint32 {
@@ -576,6 +607,7 @@ func NewPeerFromConfigStruct(pconf *Neighbor) *api.Peer {
 			},
 			PeerAsn:         s.PeerAs,
 			LocalAsn:        s.LocalAs,
+			Description:     s.Description,
 			Type:            toPeerType(s.PeerType),
 			NeighborAddress: pconf.State.NeighborAddress.String(),
 			Queues:          &api.Queues{},
@@ -649,6 +681,7 @@ func NewPeerFromConfigStruct(pconf *Neighbor) *api.Peer {
 			TcpMss:        uint32(pconf.Transport.Config.TcpMss),
 			IpTos:         uint32(pconf.Transport.Config.IpTos),
 		},
+		TcpAo:    newTcpAoPeerConfigFromConfigStruct(&pconf.TcpAo.Config),
 		AfiSafis: afiSafis,
 		Bfd: &api.BfdPeerConfig{
 			Enabled:                  pconf.Bfd.Config.Enabled,
@@ -657,6 +690,88 @@ func NewPeerFromConfigStruct(pconf *Neighbor) *api.Peer {
 			RequiredMinimumReceive:   pconf.Bfd.Config.RequiredMinimumReceive,
 			DetectionMultiplier:      uint32(pconf.Bfd.Config.DetectionMultiplier),
 		},
+	}
+}
+
+func NewTcpAoKeychainsFromConfigStruct(chains []Keychain) ([]*api.TcpAoKeychain, error) {
+	result := make([]*api.TcpAoKeychain, 0, len(chains))
+	names := make(map[string]struct{}, len(chains))
+	for i := range chains {
+		chain, err := newTcpAoKeychainFromConfigStruct(&chains[i])
+		if err != nil {
+			return nil, err
+		}
+		if _, ok := names[chain.Name]; ok {
+			return nil, fmt.Errorf("duplicate TCP-AO keychain %q", chain.Name)
+		}
+		names[chain.Name] = struct{}{}
+		result = append(result, chain)
+	}
+	return result, nil
+}
+
+func newTcpAoKeychainFromConfigStruct(chain *Keychain) (*api.TcpAoKeychain, error) {
+	name := chain.Config.Name
+	if name == "" {
+		return nil, fmt.Errorf("TCP-AO keychain name is required")
+	}
+	result := &api.TcpAoKeychain{
+		Name: name,
+		Keys: make([]*api.TcpAoKey, 0, len(chain.Keys)),
+	}
+	for i, key := range chain.Keys {
+		masterKey, err := readTcpAoMasterKey(key.Config.SecretKey)
+		if err != nil {
+			return nil, fmt.Errorf("TCP-AO keychain %q key %d: %w", name, i, err)
+		}
+		algorithm, err := tcpAoAlgorithmToAPI(key.Config.CryptoAlgorithm)
+		if err != nil {
+			return nil, fmt.Errorf("TCP-AO keychain %q key %d: %w", name, i, err)
+		}
+		result.Keys = append(result.Keys, &api.TcpAoKey{
+			SendId:            uint32(key.Config.KeyId),
+			ReceiveId:         uint32(key.Config.ReceiveId),
+			Algorithm:         algorithm,
+			ExcludeTcpOptions: key.Config.ExcludeTcpOptions,
+			MasterKey:         masterKey,
+		})
+	}
+	return result, nil
+}
+
+func tcpAoAlgorithmToAPI(algorithm CryptoType) (api.TcpAoAlgorithm, error) {
+	switch algorithm {
+	case CRYPTO_TYPE_HMAC_SHA_1_96:
+		return api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA1_96, nil
+	case CRYPTO_TYPE_AES_128_CMAC_96:
+		return api.TcpAoAlgorithm_TCP_AO_ALGORITHM_AES_128_CMAC_96, nil
+	case CRYPTO_TYPE_HMAC_SHA_256_96:
+		return api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA256_96, nil
+	case CRYPTO_TYPE_HMAC_SHA_256_128:
+		return api.TcpAoAlgorithm_TCP_AO_ALGORITHM_HMAC_SHA256_128, nil
+	default:
+		return api.TcpAoAlgorithm_TCP_AO_ALGORITHM_UNSPECIFIED, fmt.Errorf("unsupported algorithm %q", algorithm)
+	}
+}
+
+func readTcpAoMasterKey(secretKey string) ([]byte, error) {
+	if secretKey == "" {
+		return nil, fmt.Errorf("secret-key is required")
+	}
+	masterKey, err := base64.StdEncoding.DecodeString(secretKey)
+	if err != nil {
+		return nil, fmt.Errorf("secret-key must be base64 encoded: %w", err)
+	}
+	return masterKey, nil
+}
+
+func newTcpAoPeerConfigFromConfigStruct(config *TcpAoConfig) *api.TcpAoPeerConfig {
+	if config.Keychain == "" {
+		return nil
+	}
+	return &api.TcpAoPeerConfig{
+		Keychain: string(config.Keychain),
+		SendId:   uint32(config.SendId),
 	}
 }
 
@@ -740,6 +855,7 @@ func NewPeerGroupFromConfigStruct(pconf *PeerGroup) *api.PeerGroup {
 			TcpMss:        uint32(pconf.Transport.Config.TcpMss),
 			IpTos:         uint32(pconf.Transport.Config.IpTos),
 		},
+		TcpAo:    newTcpAoPeerConfigFromConfigStruct(&pconf.TcpAo.Config),
 		AfiSafis: afiSafis,
 		Bfd: &api.BfdPeerConfig{
 			Enabled:                  pconf.Bfd.Config.Enabled,
@@ -801,12 +917,21 @@ func NewGlobalFromConfigStruct(c *Global) *api.Global {
 }
 
 func newAPIPrefixFromConfigStruct(c Prefix) (*api.Prefix, error) {
-	min, max, err := ParseMaskLength(c.IpPrefix.String(), c.MasklengthRange)
+	prefix := c.RtcPrefix
+	if c.IpPrefix.IsValid() {
+		prefix = c.IpPrefix.String()
+	}
+	min, max, err := ParseMaskLength(prefix, c.MasklengthRange)
 	if err != nil {
 		return nil, err
 	}
+	ipPrefix := ""
+	if c.IpPrefix.IsValid() {
+		ipPrefix = c.IpPrefix.String()
+	}
 	return &api.Prefix{
-		IpPrefix:      c.IpPrefix.String(),
+		IpPrefix:      ipPrefix,
+		RtcPrefix:     c.RtcPrefix,
 		MaskLengthMin: uint32(min),
 		MaskLengthMax: uint32(max),
 	}, nil

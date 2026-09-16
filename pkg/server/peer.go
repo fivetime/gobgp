@@ -65,6 +65,12 @@ func (pg *peerGroup) DeleteDynamicNeighbor(prefix string) {
 }
 
 func newDynamicPeer(g *oc.Global, neighborAddress string, pg *oc.PeerGroup, loc *table.TableManager, policy *table.RoutingPolicy, logger *slog.Logger) *peer {
+	if pg.TcpAo.Config.Keychain != "" {
+		logger.Debug("TCP-AO dynamic neighbors are not supported",
+			slog.String("Topic", "Peer"),
+			slog.String("Key", neighborAddress))
+		return nil
+	}
 	conf := oc.Neighbor{
 		Config: oc.NeighborConfig{
 			PeerGroup: pg.Config.PeerGroupName,
@@ -93,7 +99,7 @@ func newDynamicPeer(g *oc.Global, neighborAddress string, pg *oc.PeerGroup, loc 
 		return nil
 	}
 
-	return newPeer(g, &conf, bgp.BGP_FSM_ACTIVE, loc, policy, logger)
+	return newPeer(g, &conf, bgp.BGP_FSM_ACTIVE, loc, policy, nil, logger)
 }
 
 // pathIDSet is the set of add-path local identifiers advertised for a destination.
@@ -125,7 +131,7 @@ type peer struct {
 	routeRefreshInProgress sync.RWMutex
 }
 
-func newPeer(g *oc.Global, conf *oc.Neighbor, state bgp.FSMState, loc *table.TableManager, policy *table.RoutingPolicy, logger *slog.Logger) *peer {
+func newPeer(g *oc.Global, conf *oc.Neighbor, state bgp.FSMState, loc *table.TableManager, policy *table.RoutingPolicy, tcpAo *tcpAoKeyBinding, logger *slog.Logger) *peer {
 	peer := &peer{
 		localRib:          loc,
 		policy:            policy,
@@ -140,6 +146,7 @@ func newPeer(g *oc.Global, conf *oc.Neighbor, state bgp.FSMState, loc *table.Tab
 	rfs, _ := oc.AfiSafis(conf.AfiSafis).ToRfList()
 	peer.adjRibIn = table.NewAdjRib(logger, rfs)
 	peer.rtmHandler = table.NewRouteTargetMembershipHandler()
+	peer.fsm.tcpAoKeyBinding.Store(tcpAo)
 	return peer
 }
 
@@ -657,7 +664,7 @@ func (peer *peer) updatePrefixLimitConfig(conf *oc.Neighbor, c []oc.AfiSafi) (bo
 	return reachLimit, nil
 }
 
-func (peer *peer) handleUpdate(e *fsmMsg) ([]*table.Path, []bgp.Family, bool) {
+func (peer *peer) handleUpdate(e *fsmMsg, localClusterIDs map[netip.Addr]struct{}) ([]*table.Path, []bgp.Family, bool) {
 	m := e.MsgData.(*bgp.BGPMessage)
 	update := m.Body.(*bgp.BGPUpdate)
 
@@ -678,6 +685,12 @@ func (peer *peer) handleUpdate(e *fsmMsg) ([]*table.Path, []bgp.Family, bool) {
 		paths := make([]*table.Path, 0, len(pathList))
 		eor := []bgp.Family{}
 		conf := peer.fsm.pConf.ReadOnly()
+		isIBGPPeer := peer.isIBGPPeer()
+		isRouteServerClient := peer.isRouteServerClient()
+		peer.fsm.lock.Lock()
+		routerId := peer.fsm.gConf.Config.RouterId
+		peer.fsm.lock.Unlock()
+	pathLoop:
 		for _, path := range pathList {
 			if path.IsEOR() {
 				family := path.GetFamily()
@@ -705,14 +718,10 @@ func (peer *peer) handleUpdate(e *fsmMsg) ([]*table.Path, []bgp.Family, bool) {
 					continue
 				}
 			}
-			// RFC4456 8. Avoiding Routing Information Loops
-			// A router that recognizes the ORIGINATOR_ID attribute SHOULD
-			// ignore a route received with its BGP Identifier as the ORIGINATOR_ID.
-			isIBGPPeer := peer.isIBGPPeer()
-			peer.fsm.lock.Lock()
-			routerId := peer.fsm.gConf.Config.RouterId
-			peer.fsm.lock.Unlock()
 			if isIBGPPeer {
+				// RFC4456 8. Avoiding Routing Information Loops
+				// A router that recognizes the ORIGINATOR_ID attribute SHOULD
+				// ignore a route received with its BGP Identifier as the ORIGINATOR_ID.
 				if path.GetOriginatorID() == routerId {
 					peer.fsm.logger.Debug("Originator ID is mine, ignore",
 						slog.String("OriginatorID", path.GetOriginatorID().String()),
@@ -720,6 +729,19 @@ func (peer *peer) handleUpdate(e *fsmMsg) ([]*table.Path, []bgp.Family, bool) {
 
 					path.SetRejected(true)
 					continue
+				}
+				if !isRouteServerClient {
+					// RFC4456 8. Avoiding Routing Information Loops
+					// If the local CLUSTER_ID is found in the CLUSTER_LIST, the advertisement received SHOULD be ignored.
+					for _, clusterID := range path.GetClusterList() {
+						if _, found := localClusterIDs[clusterID]; found {
+							peer.fsm.logger.Debug("cluster list path attribute has a local cluster id, ignore",
+								slog.String("ClusterID", clusterID.String()),
+								slog.String("Data", path.String()))
+							path.SetRejected(true)
+							continue pathLoop
+						}
+					}
 				}
 			}
 			paths = append(paths, path)

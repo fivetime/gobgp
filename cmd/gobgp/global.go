@@ -59,6 +59,7 @@ const (
 	ctColor
 	ctLb
 	ctMup
+	ctRedirectIP
 )
 
 var extCommNameMap = map[extCommType]string{
@@ -66,6 +67,7 @@ var extCommNameMap = map[extCommType]string{
 	ctDiscard:        "discard",
 	ctRate:           "rate-limit",
 	ctRedirect:       "redirect",
+	ctRedirectIP:     "redirect-to-ip",
 	ctMark:           "mark",
 	ctAction:         "action",
 	ctRT:             "rt",
@@ -88,6 +90,7 @@ var extCommValueMap = map[string]extCommType{
 	extCommNameMap[ctDiscard]:        ctDiscard,
 	extCommNameMap[ctRate]:           ctRate,
 	extCommNameMap[ctRedirect]:       ctRedirect,
+	extCommNameMap[ctRedirectIP]:     ctRedirectIP,
 	extCommNameMap[ctMark]:           ctMark,
 	extCommNameMap[ctAction]:         ctAction,
 	extCommNameMap[ctRT]:             ctRT,
@@ -151,6 +154,42 @@ func redirectParser(args []string) ([]bgp.ExtendedCommunityInterface, error) {
 		return []bgp.ExtendedCommunityInterface{ex}, nil
 	}
 	return nil, fmt.Errorf("invalid redirect")
+}
+
+// redirectIPParser parses "redirect-to-ip <address> [copy]". Unlike
+// redirectParser, the argument is a forwarding target, not a route target.
+func redirectIPParser(args []string) ([]bgp.ExtendedCommunityInterface, error) {
+	if len(args) < 2 || args[0] != extCommNameMap[ctRedirectIP] {
+		return nil, fmt.Errorf("invalid redirect-to-ip")
+	}
+	isCopy := false
+	switch len(args) {
+	case 2:
+	case 3:
+		if args[2] != "copy" {
+			return nil, fmt.Errorf("invalid redirect-to-ip: unexpected %q, want \"copy\"", args[2])
+		}
+		isCopy = true
+	default:
+		return nil, fmt.Errorf("invalid redirect-to-ip: want <address> [copy]")
+	}
+	addr, err := netip.ParseAddr(args[1])
+	if err != nil {
+		return nil, fmt.Errorf("invalid redirect-to-ip target %q: %w", args[1], err)
+	}
+	addr = addr.Unmap()
+	if addr.Is4() {
+		ext, err := bgp.NewFlowSpecRedirectToIPv4Extended(addr, isCopy)
+		if err != nil {
+			return nil, err
+		}
+		return []bgp.ExtendedCommunityInterface{ext}, nil
+	}
+	ext, err := bgp.NewFlowSpecRedirectToIPv6Extended(addr, isCopy)
+	if err != nil {
+		return nil, err
+	}
+	return []bgp.ExtendedCommunityInterface{ext}, nil
 }
 
 func markParser(args []string) ([]bgp.ExtendedCommunityInterface, error) {
@@ -469,6 +508,7 @@ var extCommParserMap = map[extCommType]func([]string) ([]bgp.ExtendedCommunityIn
 	ctDiscard:        rateLimitParser,
 	ctRate:           rateLimitParser,
 	ctRedirect:       redirectParser,
+	ctRedirectIP:     redirectIPParser,
 	ctMark:           markParser,
 	ctAction:         actionParser,
 	ctRT:             rtParser,
@@ -1067,7 +1107,7 @@ func parseEvpnIPPrefixArgs(args []string) (bgp.NLRI, []string, error) {
 
 func parseEvpnIPMSIArgs(args []string) (bgp.NLRI, []string, error) {
 	// Format:
-	// etag <etag> rd <rd> [rt <rt>...] [encap <encap type>]
+	// etag <etag> rd <rd> rt <rt> [encap <encap type>]
 	req := 4
 	if len(args) < req {
 		return nil, nil, fmt.Errorf("%d args required at least, but got %d", req, len(args))
@@ -1081,7 +1121,7 @@ func parseEvpnIPMSIArgs(args []string) (bgp.NLRI, []string, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	for _, f := range []string{"etag", "rd"} {
+	for _, f := range []string{"etag", "rd", "rt"} {
 		for len(m[f]) == 0 {
 			return nil, nil, fmt.Errorf("specify %s", f)
 		}
@@ -1099,10 +1139,8 @@ func parseEvpnIPMSIArgs(args []string) (bgp.NLRI, []string, error) {
 	etag := uint32(e)
 
 	extcomms := make([]string, 0)
-	if len(m["rt"]) > 0 {
-		extcomms = append(extcomms, "rt")
-		extcomms = append(extcomms, m["rt"]...)
-	}
+	extcomms = append(extcomms, "rt")
+	extcomms = append(extcomms, m["rt"]...)
 	ec, err := bgp.ParseExtendedCommunity(bgp.EC_SUBTYPE_SOURCE_AS, m["rt"][0])
 	if err != nil {
 		return nil, nil, fmt.Errorf("route target parse failed")
@@ -2779,7 +2817,7 @@ func parseLsArgs(args []string) (bgp.NLRI, *bgp.PathAttributeLs, error) {
 
 func parseRtcArgs(args []string) (bgp.NLRI, error) {
 	// Format:
-	// asn <asn> rt <rt> | default
+	// <as>:<rt>[/len] | asn <asn> rt <rt> | default
 	m, err := extractReserved(args, map[string]int{
 		"asn":     paramSingle,
 		"rt":      paramSingle,
@@ -2793,13 +2831,21 @@ func parseRtcArgs(args []string) (bgp.NLRI, error) {
 		return bgp.NewRouteTargetMembershipNLRI(0, nil), nil
 	}
 
+	if len(m[""]) != 0 {
+		nlri, err := bgp.ParseRouteTargetMembershipNLRI(m[""][0])
+		if err != nil {
+			return nil, err
+		}
+		return nlri, nil
+	}
+
 	for _, f := range []string{"asn", "rt"} {
 		if len(m[f]) == 0 {
 			return nil, fmt.Errorf("specify %s", f)
 		}
 	}
 
-	asn, err := toAs4Value(m["asn"][0])
+	asn, err := bgp.ParseAs4Value(m["asn"][0])
 	if err != nil {
 		return nil, err
 	}
@@ -2832,26 +2878,6 @@ func extractOrigin(args []string) ([]string, bgp.PathAttributeInterface, error) 
 	return args, bgp.NewPathAttributeOrigin(typ), nil
 }
 
-func toAs4Value(s string) (uint32, error) {
-	if strings.Contains(s, ".") {
-		v := strings.Split(s, ".")
-		upper, err := strconv.ParseUint(v[0], 10, 16)
-		if err != nil {
-			return 0, nil
-		}
-		lower, err := strconv.ParseUint(v[1], 10, 16)
-		if err != nil {
-			return 0, nil
-		}
-		return uint32(upper<<16 | lower), nil
-	}
-	i, err := strconv.ParseUint(s, 10, 32)
-	if err != nil {
-		return 0, err
-	}
-	return uint32(i), nil
-}
-
 var (
 	_regexpASPathGroups  = regexp.MustCompile("[{}]")
 	_regexpASPathSegment = regexp.MustCompile(`,|\s+`)
@@ -2872,7 +2898,7 @@ func newAsPath(aspath string) (bgp.PathAttributeInterface, error) {
 			if n == "" {
 				continue
 			}
-			if asn, err := toAs4Value(n); err != nil {
+			if asn, err := bgp.ParseAs4Value(n); err != nil {
 				return nil, err
 			} else {
 				asNums = append(asNums, asn)
@@ -3244,7 +3270,7 @@ func parsePath(rf bgp.Family, args []string) (*api.Path, error) {
 		ipv6extcomms := make([]bgp.ExtendedCommunityInterface, 0)
 		for _, com := range extcomms {
 			switch com.(type) {
-			case *bgp.RedirectIPv6AddressSpecificExtended:
+			case *bgp.RedirectIPv6AddressSpecificExtended, *bgp.FlowSpecRedirectToIPv6Extended:
 				ipv6extcomms = append(ipv6extcomms, com)
 			default:
 				normalextcomms = append(normalextcomms, com)
@@ -3332,6 +3358,7 @@ usage: %s rib -a %%s %s%%s match <MATCH> then <THEN>%%s%%s%%s
                %s |
                %s <RATE> [as <AS>] |
                %s <RT> [color <color>] [prefix <prefix>] [locator-node-length <length>] [function-length <length>] [behavior <behavior>] |
+               %s <ADDRESS> [copy] |
                %s <DEC_NUM> |
                %s { sample | terminal | sample-terminal } }...
     <RT> : xxx:yyy, xxx.xxx.xxx.xxx:yyy, xxxx::xxxx:yyy, xxx.xxx:yyy`,
@@ -3347,6 +3374,7 @@ usage: %s rib -a %%s %s%%s match <MATCH> then <THEN>%%s%%s%%s
 			extCommNameMap[ctDiscard],
 			extCommNameMap[ctRate],
 			extCommNameMap[ctRedirect],
+			extCommNameMap[ctRedirectIP],
 			extCommNameMap[ctMark],
 			extCommNameMap[ctAction],
 		)
@@ -3472,7 +3500,7 @@ usage: %s rib -a %%s %s %%s [origin { igp | egp | incomplete }] [aspath <ASPATH>
 			cmdstr,
 			modtype,
 		)
-		helpErrMap[bgp.RF_RTC_UC] = fmt.Errorf(rtcHelpMsgFmt, "rtc", "{ asn <ASN> rt <RT> | default }")
+		helpErrMap[bgp.RF_RTC_UC] = fmt.Errorf(rtcHelpMsgFmt, "rtc", "{ <ASN>:<RT>[/len] | asn <ASN> rt <RT> | default }")
 
 		if err, ok := helpErrMap[rf]; ok {
 			return err

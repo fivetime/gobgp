@@ -39,7 +39,7 @@ func AddTCPAOKeysSockopt(sc syscall.RawConn, peer netip.Prefix, interfaceName st
 	if err := validateTCPAOPeerScope(peer, vrfIfIndex); err != nil {
 		return err
 	}
-	if err := validateTCPAOAddKeys(config.Keys); err != nil {
+	if err := ValidateTCPAOKeys(config.Keys); err != nil {
 		return err
 	}
 	preferredKey, err := getPreferredTCPAOKey(config)
@@ -59,7 +59,12 @@ func AddTCPAOKeysSockopt(sc syscall.RawConn, peer netip.Prefix, interfaceName st
 }
 
 // DeleteTCPAOKeysSockopt removes all configured keys from a TCP socket.
-func DeleteTCPAOKeysSockopt(sc syscall.RawConn, peer netip.Prefix, interfaceName string, config TCPAOConfig) error {
+// delAsync skips the RCU grace period that the kernel otherwise waits for on
+// every key, so a listening socket with many keys is much cheaper to update.
+// The kernel only accepts it on a listening socket and returns EINVAL
+// otherwise, because CurrentKey and RNextKey do not exist on a listener and
+// need no check.
+func DeleteTCPAOKeysSockopt(sc syscall.RawConn, peer netip.Prefix, interfaceName string, config TCPAOConfig, delAsync bool) error {
 	vrfIfIndex, err := vrfInterfaceIndex(interfaceName)
 	if err != nil {
 		return err
@@ -71,7 +76,7 @@ func DeleteTCPAOKeysSockopt(sc syscall.RawConn, peer netip.Prefix, interfaceName
 		return err
 	}
 	for _, key := range config.Keys {
-		command, err := marshalTCPAODel(peer, vrfIfIndex, key)
+		command, err := marshalTCPAODel(peer, vrfIfIndex, key, delAsync)
 		if err != nil {
 			return err
 		}
@@ -191,44 +196,6 @@ func validateTCPAOPeerScope(prefix netip.Prefix, ifIndex int32) error {
 	}
 	if prefix.Bits() != 0 && addr.IsUnspecified() {
 		return fmt.Errorf("TCP-AO unspecified peer address requires a zero-length prefix")
-	}
-	return nil
-}
-
-func validateTCPAOAddKeys(keys []TCPAOKey) error {
-	if err := validateTCPAOKeyIDs(keys); err != nil {
-		return err
-	}
-	for _, key := range keys {
-		if len(key.MasterKey) == 0 || len(key.MasterKey) > tcpAOMaxKeyLen {
-			return fmt.Errorf("TCP-AO key with SendID %d must contain 1-%d master-key bytes", key.SendID, tcpAOMaxKeyLen)
-		}
-		switch key.Algorithm {
-		case TCPAOAlgorithmHMACSHA1, TCPAOAlgorithmAES128CMAC:
-		default:
-			return fmt.Errorf("unsupported TCP-AO algorithm for SendID %d", key.SendID)
-		}
-	}
-	return nil
-}
-
-func validateTCPAOKeyIDs(keys []TCPAOKey) error {
-	if len(keys) == 0 {
-		return fmt.Errorf("TCP-AO requires at least one key")
-	}
-	if len(keys) > tcpAOKeyIDCount {
-		return fmt.Errorf("TCP-AO supports at most %d keys per peer scope", tcpAOKeyIDCount)
-	}
-	var sendIDs, receiveIDs [tcpAOKeyIDCount]bool
-	for _, key := range keys {
-		if sendIDs[key.SendID] {
-			return fmt.Errorf("duplicate TCP-AO SendID %d", key.SendID)
-		}
-		if receiveIDs[key.ReceiveID] {
-			return fmt.Errorf("duplicate TCP-AO ReceiveID %d", key.ReceiveID)
-		}
-		sendIDs[key.SendID] = true
-		receiveIDs[key.ReceiveID] = true
 	}
 	return nil
 }

@@ -20,6 +20,7 @@ import (
 	"testing"
 
 	"github.com/osrg/gobgp/v4/api"
+	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -32,6 +33,31 @@ func TestDetectConfigFileType(t *testing.T) {
 	assert.Equal("yaml", detectConfigFileType("bgpd.yaml", "xxx"))
 	assert.Equal("yaml", detectConfigFileType("bgpd.yml", "xxx"))
 	assert.Equal("json", detectConfigFileType("bgpd.json", "xxx"))
+}
+
+func TestReadTcpAoMasterKey(t *testing.T) {
+	tests := []struct {
+		name    string
+		secret  string
+		expect  []byte
+		wantErr bool
+	}{
+		{name: "base64", secret: "AAEC", expect: []byte{0, 1, 2}},
+		{name: "missing", wantErr: true},
+		{name: "invalid base64", secret: "%%%", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			key, err := readTcpAoMasterKey(tt.secret)
+			if tt.wantErr {
+				require.Error(t, err)
+				return
+			}
+			require.NoError(t, err)
+			assert.Equal(t, tt.expect, key)
+		})
+	}
 }
 
 func TestIsAfiSafiChanged(t *testing.T) {
@@ -244,4 +270,185 @@ func TestNewPeerGroupFromConfigStruct_BfdConfig(t *testing.T) {
 		assert.Equal(t, uint32(0), cfg.RequiredMinimumReceive)
 		assert.Equal(t, uint32(0), cfg.DetectionMultiplier)
 	})
+}
+
+func newPeerFromConfigForTCPAOTest(t *testing.T, tcpAo TcpAo) *api.Peer {
+	t.Helper()
+	n := &Neighbor{
+		Config: NeighborConfig{
+			NeighborAddress: netip.MustParseAddr("192.0.2.1"),
+			PeerAs:          65001,
+		},
+		TcpAo: tcpAo,
+	}
+	p := NewPeerFromConfigStruct(n)
+	require.NotNil(t, p)
+	return p
+}
+
+func newPeerGroupFromConfigForTCPAOTest(t *testing.T, tcpAo TcpAo) *api.PeerGroup {
+	t.Helper()
+	pg := &PeerGroup{
+		Config: PeerGroupConfig{
+			PeerGroupName: "pg-tcp-ao-test",
+			PeerAs:        65001,
+		},
+		TcpAo: tcpAo,
+	}
+	return NewPeerGroupFromConfigStruct(pg)
+}
+
+func TestNewPeerFromConfigStruct_TcpAoConfig(t *testing.T) {
+	t.Run("keychain_and_send_id", func(t *testing.T) {
+		p := newPeerFromConfigForTCPAOTest(t, TcpAo{
+			Config: TcpAoConfig{Keychain: "fabric", SendId: 3},
+		})
+		cfg := p.GetTcpAo()
+		require.NotNil(t, cfg)
+		assert.Equal(t, "fabric", cfg.Keychain)
+		assert.Equal(t, uint32(3), cfg.SendId)
+	})
+
+	// RFC 5925 section 3.1 allows any MKT ID from 0 to 255, so send-id 0
+	// selects the key with SendID 0. It does not mean "not set".
+	t.Run("send_id_zero_is_kept", func(t *testing.T) {
+		p := newPeerFromConfigForTCPAOTest(t, TcpAo{
+			Config: TcpAoConfig{Keychain: "fabric", SendId: 0},
+		})
+		cfg := p.GetTcpAo()
+		require.NotNil(t, cfg)
+		assert.Equal(t, "fabric", cfg.Keychain)
+		assert.Equal(t, uint32(0), cfg.SendId)
+	})
+
+	// An empty keychain is how the config model says that the peer does not
+	// use TCP-AO, so no API message is built even if send-id is set.
+	t.Run("no_keychain_disables_tcp_ao", func(t *testing.T) {
+		p := newPeerFromConfigForTCPAOTest(t, TcpAo{})
+		assert.Nil(t, p.GetTcpAo())
+	})
+
+	t.Run("send_id_without_keychain_is_dropped", func(t *testing.T) {
+		p := newPeerFromConfigForTCPAOTest(t, TcpAo{
+			Config: TcpAoConfig{SendId: 3},
+		})
+		assert.Nil(t, p.GetTcpAo())
+	})
+}
+
+func TestNewPeerGroupFromConfigStruct_TcpAoConfig(t *testing.T) {
+	t.Run("keychain_and_send_id", func(t *testing.T) {
+		pg := newPeerGroupFromConfigForTCPAOTest(t, TcpAo{
+			Config: TcpAoConfig{Keychain: "fabric", SendId: 7},
+		})
+		cfg := pg.GetTcpAo()
+		require.NotNil(t, cfg)
+		assert.Equal(t, "fabric", cfg.Keychain)
+		assert.Equal(t, uint32(7), cfg.SendId)
+	})
+
+	t.Run("no_keychain_disables_tcp_ao", func(t *testing.T) {
+		pg := newPeerGroupFromConfigForTCPAOTest(t, TcpAo{})
+		assert.Nil(t, pg.GetTcpAo())
+	})
+}
+
+func TestParseMaskLength(t *testing.T) {
+	assert := assert.New(t)
+	cases := []struct {
+		prefix string
+		mask   string
+		min    int
+		max    int
+		err    bool
+	}{
+		// IPv4: default mask = prefix length.
+		{"10.0.0.0/24", "", 24, 24, false},
+		// IPv4: range within 0..32.
+		{"10.0.0.0/24", "24..32", 24, 32, false},
+		// IPv4: out-of-scope (>32) rejected.
+		{"10.0.0.0/24", "24..40", 0, 0, true},
+
+		// IPv6: default mask = prefix length.
+		{"2001:db8::/32", "", 32, 32, false},
+		// IPv6: range within 0..128.
+		{"2001:db8::/32", "32..128", 32, 128, false},
+		// IPv6: out-of-scope (>128) rejected.
+		{"2001:db8::/32", "32..200", 0, 0, true},
+
+		// RTC: default mask = prefix length.
+		{"65000:65000:100/96", "", 96, 96, false},
+		// RTC: explicit range within 0..96.
+		{"65000:65000:100/96", "32..96", 32, 96, false},
+		{"0:0:0/0", "32..96", 32, 96, false},
+		// RTC: out-of-scope (>96) rejected.
+		{"65000:65000:100/96", "90..128", 0, 0, true},
+		// RTC: malformed prefix.
+		{"65000:65000", "96..96", 0, 0, true},
+
+		// inverted range rejected for any family.
+		{"10.0.0.0/24", "32..24", 0, 0, true},
+		{"65000:65000:100/96", "96..32", 0, 0, true},
+		// malformed range.
+		{"10.0.0.0/24", "24", 0, 0, true},
+	}
+	for _, c := range cases {
+		min, max, err := ParseMaskLength(c.prefix, c.mask)
+		if c.err {
+			assert.Error(err, "%s %s", c.prefix, c.mask)
+			continue
+		}
+		assert.NoError(err, c.prefix)
+		assert.Equal(c.min, min, c.prefix)
+		assert.Equal(c.max, max, c.prefix)
+	}
+}
+
+func TestPrefixToPrefix(t *testing.T) {
+	assert := assert.New(t)
+	pfx, rf, err := (&Prefix{IpPrefix: netip.MustParsePrefix("10.0.0.0/24")}).ToPrefix()
+	assert.NoError(err)
+	assert.Equal("10.0.0.0/24", pfx.String())
+	assert.Equal(bgp.RF_IPv4_UC, rf)
+
+	pfx, rf, err = (&Prefix{IpPrefix: netip.MustParsePrefix("2001:db8::/32")}).ToPrefix()
+	assert.NoError(err)
+	assert.Equal("2001:db8::/32", pfx.String())
+	assert.Equal(bgp.RF_IPv6_UC, rf)
+
+	pfx, rf, err = (&Prefix{RtcPrefix: "123:65000:100/96"}).ToPrefix()
+	assert.NoError(err)
+	assert.Equal(bgp.RF_RTC_UC, rf)
+	assert.Equal(96, pfx.Bits())
+
+	// /0 wildcard and /32 origin-AS-only forms.
+	pfx, rf, err = (&Prefix{RtcPrefix: "0:0:0/0"}).ToPrefix()
+	assert.NoError(err)
+	assert.Equal(bgp.RF_RTC_UC, rf)
+	assert.Equal(0, pfx.Bits())
+	pfx, rf, err = (&Prefix{RtcPrefix: "123:65000:0/32"}).ToPrefix()
+	assert.NoError(err)
+	assert.Equal(bgp.RF_RTC_UC, rf)
+	assert.Equal(32, pfx.Bits())
+
+	_, _, err = (&Prefix{IpPrefix: netip.MustParsePrefix("10.0.0.0/24"), RtcPrefix: "123:65000:100/96"}).ToPrefix()
+	assert.Error(err)
+	_, _, err = (&Prefix{}).ToPrefix()
+	assert.Error(err)
+}
+
+func TestNewAPIPrefixFromConfigStructRtc(t *testing.T) {
+	assert := assert.New(t)
+	// rtc-prefix config round-trips into the api.Prefix RtcPrefix field
+	out, err := newAPIPrefixFromConfigStruct(Prefix{RtcPrefix: "65000:65000:100/96", MasklengthRange: "96..96"})
+	assert.NoError(err)
+	assert.Equal(&api.Prefix{RtcPrefix: "65000:65000:100/96", MaskLengthMin: 96, MaskLengthMax: 96}, out)
+	// ip-prefix config unchanged
+	out, err = newAPIPrefixFromConfigStruct(Prefix{IpPrefix: netip.MustParsePrefix("10.0.0.0/24"), MasklengthRange: "24..24"})
+	assert.NoError(err)
+	assert.Equal(&api.Prefix{IpPrefix: "10.0.0.0/24", MaskLengthMin: 24, MaskLengthMax: 24}, out)
+	// /0 wildcard round-trips with an open mask range.
+	out, err = newAPIPrefixFromConfigStruct(Prefix{RtcPrefix: "0:0:0/0", MasklengthRange: "0..96"})
+	assert.NoError(err)
+	assert.Equal(&api.Prefix{RtcPrefix: "0:0:0/0", MaskLengthMin: 0, MaskLengthMax: 96}, out)
 }

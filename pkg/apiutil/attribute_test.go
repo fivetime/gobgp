@@ -17,6 +17,7 @@ package apiutil
 
 import (
 	"bytes"
+	"encoding/binary"
 	"net/netip"
 	"testing"
 
@@ -1488,6 +1489,45 @@ func Test_TunnelEncapAttribute(t *testing.T) {
 	assert.True(proto.Equal(input, output))
 }
 
+func Test_SRBSIDLabelRoundTrip(t *testing.T) {
+	// The API carries an SR-MPLS Binding SID as the plain label value.
+	// UnmarshalSRBSID shifts it into the high 20 bits of the 4-octet label
+	// stack entry (RFC 9830 Figure 6); MarshalSRBSID must undo that shift so
+	// the label survives an unmarshal/marshal round trip.
+	const label = 100
+	sid := make([]byte, 4)
+	binary.BigEndian.PutUint32(sid, label)
+
+	native, err := UnmarshalSRBSID(&api.TunnelEncapSubTLVSRBindingSID{
+		Bsid: &api.TunnelEncapSubTLVSRBindingSID_SrBindingSid{
+			SrBindingSid: &api.SRBindingSID{Sid: sid, SFlag: true},
+		},
+	})
+	require.NoError(t, err)
+
+	// The native wire value has the label in the high 20 bits.
+	srbsid := native.(*bgp.TunnelEncapSubTLVSRBSID)
+	require.Equal(t, uint32(label<<12), binary.BigEndian.Uint32(srbsid.BSID.Value))
+
+	out, err := MarshalSRBSID(srbsid)
+	require.NoError(t, err)
+	assert.Equal(t, uint32(label), binary.BigEndian.Uint32(out.Sid))
+	assert.True(t, out.SFlag)
+}
+
+func Test_SRBSIDSRv6NotShifted(t *testing.T) {
+	// A 16-octet SRv6 SID carried in the Binding SID sub-TLV must be copied
+	// verbatim, without the SR-MPLS label shift.
+	sid := netip.MustParseAddr("2001:db8::1").AsSlice()
+	native := &bgp.TunnelEncapSubTLVSRBSID{
+		TunnelEncapSubTLV: bgp.TunnelEncapSubTLV{Type: bgp.ENCAP_SUBTLV_TYPE_SRBINDING_SID, Length: 18},
+		BSID:              &bgp.BSID{Value: sid},
+	}
+	out, err := MarshalSRBSID(native)
+	require.NoError(t, err)
+	assert.Equal(t, sid, out.Sid)
+}
+
 func Test_IP6ExtendedCommunitiesAttribute(t *testing.T) {
 	assert := assert.New(t)
 
@@ -2066,6 +2106,14 @@ func Test_ExtendedCommunitiesAttribute_MUPInvalidSubType(t *testing.T) {
 	}
 }
 
+// A Link-State NLRI type that has no API representation must be reported
+// rather than marshalled as an LsAddrPrefix without an NLRI.
+func Test_MarshalLsNLRIUnhandledType(t *testing.T) {
+	_, err := MarshalNLRI(&bgp.LsAddrPrefix{Type: bgp.LS_NLRI_TYPE_NODE})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "unsupported BGP-LS NLRI type")
+}
+
 // A Link-State NLRI whose mandatory sub-messages are omitted must be rejected
 // with an error rather than nil-dereferencing while it is unmarshalled.
 func Test_UnmarshalLsNLRIMissingSubMessages(t *testing.T) {
@@ -2434,4 +2482,50 @@ func Test_LsNodeNLRIWithoutBgpRouterIDRoundTrip(t *testing.T) {
 
 	_, err = UnmarshalNLRI(bgp.RF_LS, marshalled)
 	assert.NoError(t, err)
+}
+
+func Test_ExtendedCommunitiesAttribute_FlowSpecRedirectToIP(t *testing.T) {
+	assert := assert.New(t)
+
+	for _, isCopy := range []bool{false, true} {
+		input := &api.ExtendedCommunitiesAttribute{
+			Communities: []*api.ExtendedCommunity{
+				{Extcom: &api.ExtendedCommunity_FlowSpecRedirectToIpv4{FlowSpecRedirectToIpv4: &api.FlowSpecRedirectToIPv4Extended{
+					Address: "198.51.100.11",
+					Copy:    isCopy,
+				}}},
+			},
+		}
+
+		a := &api.Attribute{Attr: &api.Attribute_ExtendedCommunities{ExtendedCommunities: input}}
+		n, err := UnmarshalAttribute(a)
+		assert.NoError(err)
+
+		output, err := NewExtendedCommunitiesAttributeFromNative(n.(*bgp.PathAttributeExtendedCommunities))
+		assert.NoError(err)
+		assert.True(proto.Equal(input, output))
+	}
+}
+
+func Test_IP6ExtendedCommunitiesAttribute_FlowSpecRedirectToIP(t *testing.T) {
+	assert := assert.New(t)
+
+	for _, isCopy := range []bool{false, true} {
+		input := &api.IP6ExtendedCommunitiesAttribute{
+			Communities: []*api.IP6ExtendedCommunitiesAttribute_Community{
+				{Extcom: &api.IP6ExtendedCommunitiesAttribute_Community_FlowSpecRedirectToIpv6{FlowSpecRedirectToIpv6: &api.FlowSpecRedirectToIPv6Extended{
+					Address: "2001:db8::1",
+					Copy:    isCopy,
+				}}},
+			},
+		}
+
+		a := &api.Attribute{Attr: &api.Attribute_Ip6ExtendedCommunities{Ip6ExtendedCommunities: input}}
+		n, err := UnmarshalAttribute(a)
+		assert.NoError(err)
+
+		output, err := NewIP6ExtendedCommunitiesAttributeFromNative(n.(*bgp.PathAttributeIP6ExtendedCommunities))
+		assert.NoError(err)
+		assert.True(proto.Equal(input, output))
+	}
 }

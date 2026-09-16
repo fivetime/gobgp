@@ -824,12 +824,20 @@ module gobgp {
     uses gobgp-adjacent-table;
   }
 
+  // The bodies of these typedefs are never used. bgpyang2golang.py maps each
+  // type name to a Go type through _type_translation_map, and skips the
+  // typedef itself through _typedef_exclude. They exist so that pyang can
+  // resolve the references below.
   typedef bgp-capability {
       type uint8;
   }
 
   typedef bgp-open-message {
       type uint8;
+  }
+
+  typedef route-family {
+      type uint32;
   }
 
   augment "/bgp:bgp/bgp:neighbors/bgp:neighbor/bgp:state" {
@@ -1045,6 +1053,25 @@ module gobgp {
       description
             "neighbor ip address or prefix";
       type string;
+    }
+  }
+
+  // ip-prefix and rtc-prefix are mutually exclusive. That cannot be expressed
+  // here: ip-prefix is a key leaf of rpol:prefix, and RFC 7950 7.8.2 says any
+  // "mandatory" statement in a key leaf is ignored. Prefix.ToPrefix() rejects
+  // an entry that sets both. The existing match-prefix-set condition is reused
+  // for RTC (RF_RTC_UC) paths.
+  augment "/rpol:routing-policy/rpol:defined-sets/rpol:prefix-sets/" +
+      "rpol:prefix-set/rpol:prefix" {
+    leaf rtc-prefix {
+      type string {
+        pattern '\d+(\.\d+)?:(\d+\.\d+\.\d+\.\d+|\d+(\.\d+)?):\d+(/\d+)?';
+      }
+      description
+        "Route Target in RFC 4684 NLRI key form:
+        <origin-as>:<route-target>[/<masklen>], where <route-target> follows
+        the extended community Route Target notation. Mutually exclusive with
+        ip-prefix.";
     }
   }
 
@@ -1279,33 +1306,6 @@ module gobgp {
 
   augment "/bgp:bgp" {
     uses zebra-set;
-  }
-
-  grouping collector-config {
-    leaf url {
-      type string;
-    }
-    leaf db-name {
-      type string;
-    }
-    leaf table-dump-interval {
-      type uint64;
-    }
-  }
-
-  grouping collector-set {
-    container collector {
-      container config {
-        uses collector-config;
-      }
-      container state {
-        uses collector-config;
-      }
-    }
-  }
-
-  augment "/bgp:bgp" {
-    uses collector-set;
   }
 
   grouping listen-config {
@@ -1667,5 +1667,216 @@ module gobgp {
   augment "/bgp:bgp/bgp:neighbors/bgp:neighbor" {
     description "BFD configuration for neighbor";
     uses gobgp-bfd-config-set;
+  }
+
+  // The keychain definitions below follow the structure of
+  // openconfig-keychain 0.5.0, limited to fields supported by GoBGP.
+
+  identity crypto-type {
+    description
+      "Base identify for the cryptographic algorithm";
+  }
+
+  identity hmac-sha-1-96 {
+    base crypto-type;
+    description
+      "HMAC-SHA-1-96 keyed hash algorithm constructed from SHA-1 hash
+      function and used as a HMAC, operating on 64-byte blocks of data.";
+    reference
+      "RFC 2404 - The Use of HMAC-SHA-1-96 within ESP and AH";
+  }
+
+  identity aes-128-cmac-96 {
+    base crypto-type;
+    description
+      "AES-128-CMAC-96 keyed hash function based on a AES-128 block
+      cipher.";
+    reference
+      "RFC 4494 - The AES-CMAC-96 Algorithm and Its Use with IPsec";
+  }
+
+  identity hmac-sha-256-96 {
+    base crypto-type;
+    description
+      "HMAC-SHA-256 with a 96-bit MAC.";
+  }
+
+  identity hmac-sha-256-128 {
+    base crypto-type;
+    description
+      "HMAC-SHA-256 with a 128-bit MAC.";
+  }
+
+  typedef keychain-ref {
+    type leafref {
+      path "/gobgp:keychains/gobgp:keychain/" +
+           "gobgp:config/gobgp:name";
+    }
+    description
+      "A reference to a keychain defined on the system that can be used by
+      modules that require access to keychains.";
+  }
+
+  grouping keychain-base-config {
+    description
+      "This grouping defines key-chain parameters.";
+
+    leaf name {
+      type string;
+      description
+        "Keychain name.";
+    }
+  }
+
+  grouping keychain-key-config {
+    description "This grouping defines key-chain key parameters.";
+
+    leaf key-id {
+      type uint8;
+      description
+        "TCP-AO send key identifier associated with this key.";
+    }
+
+    leaf secret-key {
+      type string;
+      description
+        "Base64-encoded TCP-AO master key.";
+    }
+
+    leaf crypto-algorithm {
+      type identityref {
+        base crypto-type;
+      }
+      description
+        "Cryptographic algorithm associated with the key.  Note that not all cryptographic
+        algorithms are available in all contexts (e.g., across different protocols).";
+    }
+
+    leaf receive-id {
+      type uint8;
+      description
+        "TCP-AO receive key identifier associated with this key.";
+    }
+
+    leaf exclude-tcp-options {
+      type boolean;
+      description
+        "Exclude TCP options from TCP-AO message authentication.";
+    }
+  }
+
+  grouping keychain-key-base {
+    description
+      "This grouping defines keychain parameters";
+
+    container keys {
+      description
+        "list of keys to be stored";
+
+      list key {
+        key "key-id";
+        description
+          "List of configured keys for the keychain.";
+
+        leaf key-id {
+          type leafref {
+            path "../config/key-id";
+          }
+          description
+            "Reference to key id.";
+        }
+
+        container config {
+          description
+            "This container defines keychain key configuration.";
+
+          uses keychain-key-config;
+        }
+      }
+    }
+  }
+
+  grouping keychain-common-base {
+    description
+      "This grouping defines keychain parameters";
+
+    container config {
+      description
+        "This container defines keychain configuration.";
+
+      uses keychain-base-config;
+    }
+  }
+
+  grouping keychain-top {
+    description
+      "This grouping define top level structure.";
+
+    container keychains {
+      description
+        "This container defines keychains.";
+
+      list keychain {
+        key "name";
+        description
+          "List of defined keychains.";
+
+        leaf name {
+          type leafref {
+            path "../config/name";
+          }
+          description
+            "Reference to configured keychain name";
+        }
+
+        uses keychain-common-base;
+        uses keychain-key-base;
+      }
+    }
+  }
+
+  uses keychain-top;
+
+  grouping gobgp-tcp-ao-config {
+    description
+      "TCP-AO keychain attachment for a BGP neighbor or peer-group.";
+
+    leaf keychain {
+      type keychain-ref;
+      mandatory true;
+      description
+        "Reference to the TCP-AO keychain used by the peer.";
+    }
+
+    leaf send-id {
+      type uint8;
+      mandatory true;
+      description
+        "TCP-AO send key identifier.";
+    }
+  }
+
+  grouping gobgp-tcp-ao-config-set {
+    container tcp-ao {
+      presence "Enables TCP-AO for the BGP transport.";
+      description
+        "TCP-AO configuration for a BGP neighbor or peer-group.";
+
+      container config {
+        description
+          "TCP-AO configuration parameters.";
+        uses gobgp-tcp-ao-config;
+      }
+    }
+  }
+
+  augment "/bgp:bgp/bgp:peer-groups/bgp:peer-group" {
+    description "TCP-AO configuration for peer-group";
+    uses gobgp-tcp-ao-config-set;
+  }
+
+  augment "/bgp:bgp/bgp:neighbors/bgp:neighbor" {
+    description "TCP-AO configuration for neighbor";
+    uses gobgp-tcp-ao-config-set;
   }
 }

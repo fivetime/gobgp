@@ -99,7 +99,7 @@ func Test_RxPacket(t *testing.T) {
 
 	assert.Equal(p.stats.rxPacket.Load(), uint64(0))
 
-	p.Rx(&bfd.BFDHeader{DetectTimeMultiplier: 5})
+	p.Rx(&bfd.BFDHeader{MyDiscriminator: 111, DetectTimeMultiplier: 5})
 
 	time.Sleep(2 * time.Second)
 	p.Stop()
@@ -248,6 +248,97 @@ func Test_RxPacketZeroMultiplierDiscarded(t *testing.T) {
 	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_DOWN, p.sessionState())
 }
 
+func Test_RxPacketUnboundDiscriminatorDiscarded(t *testing.T) {
+	assert := assert.New(t)
+
+	ps := &mockPeerState{}
+	p := NewBfdPeer(ps, slog.Default(), netip.MustParseAddr("127.0.0.1"), oc.BfdConfig{
+		Port:                     13784,
+		Enabled:                  true,
+		DetectionMultiplier:      3,
+		RequiredMinimumReceive:   300000,
+		DesiredMinimumTxInterval: 300000,
+	}, "")
+	defer p.Stop()
+
+	// RFC 5880 Section 6.8.6: a zero Your Discriminator is only meaningful
+	// from a remote system in Down or AdminDown. Init carries no session
+	// binding here, so it must not drive the session Up.
+	p.rxPacket(&bfd.BFDHeader{
+		State:                bfd.StateInit,
+		MyDiscriminator:      111,
+		YourDiscriminator:    0,
+		DetectTimeMultiplier: 3,
+	})
+	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_DOWN, p.sessionState())
+	assert.Equal(uint64(1), p.stats.invalidDiscriminator.Load())
+
+	// RFC 5880 Section 6.8.6: a zero My Discriminator MUST be discarded. It
+	// is also the value setStateDown uses to mean "no remote session".
+	p.rxPacket(&bfd.BFDHeader{
+		State:                bfd.StateDown,
+		MyDiscriminator:      0,
+		YourDiscriminator:    p.myDiscriminator,
+		DetectTimeMultiplier: 3,
+	})
+	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_DOWN, p.sessionState())
+	assert.Equal(uint32(0), p.yourDiscriminator)
+	assert.Equal(uint64(2), p.stats.invalidDiscriminator.Load())
+
+	// A Down packet with a zero Your Discriminator is still accepted: that is
+	// how a remote system that has not learned our discriminator starts up.
+	p.rxPacket(&bfd.BFDHeader{
+		State:                bfd.StateDown,
+		MyDiscriminator:      222,
+		YourDiscriminator:    0,
+		DetectTimeMultiplier: 3,
+	})
+	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_INIT, p.sessionState())
+	assert.Equal(uint32(222), p.yourDiscriminator)
+}
+
+func Test_RxPacketZeroYourDiscriminatorForeignRemoteDiscarded(t *testing.T) {
+	assert := assert.New(t)
+
+	ps := &mockPeerState{}
+	p := NewBfdPeer(ps, slog.Default(), netip.MustParseAddr("127.0.0.1"), oc.BfdConfig{
+		Port:                     13784,
+		Enabled:                  true,
+		DetectionMultiplier:      3,
+		RequiredMinimumReceive:   300000,
+		DesiredMinimumTxInterval: 300000,
+	}, "")
+	defer p.Stop()
+
+	p.state.Store(int32(api.BfdSessionState_BFD_SESSION_STATE_UP))
+	p.yourDiscriminator = 12345
+
+	// The remote discriminator is already bound, so a Down packet that omits
+	// Your Discriminator and carries a different My Discriminator did not come
+	// from that remote system. Accepting it would reset the BGP peer.
+	p.rxPacket(&bfd.BFDHeader{
+		State:                bfd.StateDown,
+		MyDiscriminator:      67890,
+		YourDiscriminator:    0,
+		DetectTimeMultiplier: 3,
+	})
+	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_UP, p.sessionState())
+	assert.Equal(uint32(12345), p.yourDiscriminator)
+	assert.Equal(int64(0), atomic.LoadInt64(&ps.resetPeerCount))
+	assert.Equal(uint64(1), p.stats.invalidDiscriminator.Load())
+
+	// The bound remote system may still omit Your Discriminator when it
+	// signals Down, and that packet has to be honored.
+	p.rxPacket(&bfd.BFDHeader{
+		State:                bfd.StateDown,
+		MyDiscriminator:      12345,
+		YourDiscriminator:    0,
+		DetectTimeMultiplier: 3,
+	})
+	assert.Equal(api.BfdSessionState_BFD_SESSION_STATE_DOWN, p.sessionState())
+	assert.Equal(int64(1), atomic.LoadInt64(&ps.resetPeerCount))
+}
+
 func Test_ExpiryDoesNotResetAlreadyDownPeer(t *testing.T) {
 	assert := assert.New(t)
 
@@ -262,6 +353,55 @@ func Test_ExpiryDoesNotResetAlreadyDownPeer(t *testing.T) {
 	p.expiry()
 
 	assert.Equal(int64(0), atomic.LoadInt64(&ps.resetPeerCount))
+}
+
+// Test_JitteredTxInterval pins RFC 5880 Section 6.8.7: the transmit interval
+// must be reduced per packet by a random value of 0 to 25%, and when the
+// detect multiplier is 1, the interval must fall within 75%-90% of the
+// negotiated interval rather than the full 75%-100% range. The observed
+// min/max across many draws must land exactly on those endpoints: hitting
+// both inclusive endpoints, including the narrowed 90% ceiling, is what
+// pins the bounds rather than merely containing them.
+func Test_JitteredTxInterval(t *testing.T) {
+	assert := assert.New(t)
+
+	// multiplier > 1: bounds are [75%, 100%] of txInterval.
+	p := &bfdPeer{multiplier: 3, txInterval: 200 * time.Millisecond}
+
+	minSeen, maxSeen := p.txInterval, time.Duration(0)
+	for range 1000 {
+		d := p.jitteredTxInterval()
+		if d < minSeen {
+			minSeen = d
+		}
+		if d > maxSeen {
+			maxSeen = d
+		}
+	}
+	// 26 integer percentages in [75, 100], ~38.5 expected hits each in 1000
+	// draws; the chance either endpoint is never drawn is about
+	// (25/26)^1000 =~ 1e-17, so exact equality here is not flaky.
+	assert.Equal(150*time.Millisecond, minSeen)
+	assert.Equal(200*time.Millisecond, maxSeen)
+
+	// multiplier == 1: bounds narrow to [75%, 90%] of txInterval.
+	p1 := &bfdPeer{multiplier: 1, txInterval: 200 * time.Millisecond}
+
+	minSeen1, maxSeen1 := p1.txInterval, time.Duration(0)
+	for range 1000 {
+		d := p1.jitteredTxInterval()
+		if d < minSeen1 {
+			minSeen1 = d
+		}
+		if d > maxSeen1 {
+			maxSeen1 = d
+		}
+	}
+	// 16 integer percentages in [75, 90], ~62.5 expected hits each; the
+	// chance either endpoint is missed across 1000 draws is about
+	// (15/16)^1000 =~ 1e-28.
+	assert.Equal(150*time.Millisecond, minSeen1)
+	assert.Equal(180*time.Millisecond, maxSeen1)
 }
 
 func Test_TxPacket(t *testing.T) {

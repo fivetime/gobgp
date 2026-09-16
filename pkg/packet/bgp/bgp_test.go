@@ -19,13 +19,16 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"math"
 	"net"
 	"net/netip"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -65,11 +68,12 @@ func Test_Message(t *testing.T) {
 		m2, err := ParseBGPMessage(buf1)
 		assert.NoError(t, err)
 
-		// FIXME: shouldn't but workaround for some structs.
-		_, err = m2.Serialize()
+		// Compare the wire form, not the two structs. A decoded message
+		// keeps the length fields it read off the wire, and a message
+		// built in memory does not, so the structs never match.
+		buf2, err := m2.Serialize()
 		assert.NoError(t, err)
-
-		assert.Equal(t, m1, m2)
+		assert.Equal(t, buf1, buf2)
 	}
 }
 
@@ -133,35 +137,72 @@ func Test_RouteTargetMembershipNLRIString(t *testing.T) {
 	buf[0] = 96 // in bit length
 	binary.BigEndian.PutUint32(buf[1:5], 65546)
 	buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
 	binary.BigEndian.PutUint16(buf[7:9], 65000)
 	binary.BigEndian.PutUint32(buf[9:], 65546)
 	r := &RouteTargetMembershipNLRI{}
 	err := r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:65000:65546", r.String())
+	assert.Equal("65546:65000:65546/96", r.String())
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:65000:65546", r.String())
+	assert.Equal("65546:65000:65546/96", r.String())
+
+	// TwoOctetAsSpecificExtended/64
+	buf = make([]byte, 9)
+	buf[0] = 64 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint16(buf[7:], 65000)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:65000:0/64", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:65000:0/64", r.String())
 
 	// IPv4AddressSpecificExtended
 	buf = make([]byte, 13)
 	buf[0] = 96 // in bit length
 	binary.BigEndian.PutUint32(buf[1:5], 65546)
 	buf[5] = byte(EC_TYPE_TRANSITIVE_IP4_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
 	ip := net.ParseIP("10.0.0.1").To4()
 	copy(buf[7:11], []byte(ip))
 	binary.BigEndian.PutUint16(buf[11:], 65000)
 	r = &RouteTargetMembershipNLRI{}
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:10.0.0.1:65000", r.String())
+	assert.Equal("65546:10.0.0.1:65000/96", r.String())
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:10.0.0.1:65000", r.String())
+	assert.Equal("65546:10.0.0.1:65000/96", r.String())
+
+	// IPv4AddressSpecificExtended/80
+	buf = make([]byte, 11)
+	buf[0] = 80 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_IP4_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	ip = net.ParseIP("10.0.0.1").To4()
+	copy(buf[7:11], []byte(ip))
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:10.0.0.1:0/80", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:10.0.0.1:0/80", r.String())
 
 	// FourOctetAsSpecificExtended
 	buf = make([]byte, 13)
@@ -169,17 +210,34 @@ func Test_RouteTargetMembershipNLRIString(t *testing.T) {
 	binary.BigEndian.PutUint32(buf[1:5], 65546)
 	buf[5] = byte(EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC) // typehigh
 	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)                   // subtype
-	binary.BigEndian.PutUint32(buf[7:], 65546)
+	binary.BigEndian.PutUint32(buf[7:11], 65546)
 	binary.BigEndian.PutUint16(buf[11:], 65000)
 	r = &RouteTargetMembershipNLRI{}
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:1.10:65000", r.String())
+	assert.Equal("65546:1.10:65000/96", r.String())
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:1.10:65000", r.String())
+	assert.Equal("65546:1.10:65000/96", r.String())
+
+	// FourOctetAsSpecificExtended/80
+	buf = make([]byte, 11)
+	buf[0] = 80 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC) // typehigh
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)                   // subtype
+	binary.BigEndian.PutUint32(buf[7:], 65546)
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1.10:0/80", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:1.10:0/80", r.String())
 
 	// OpaqueExtended
 	buf = make([]byte, 13)
@@ -190,12 +248,27 @@ func Test_RouteTargetMembershipNLRIString(t *testing.T) {
 	r = &RouteTargetMembershipNLRI{}
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:1000000", r.String())
+	assert.Equal("65546:1000000/96", r.String())
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:1000000", r.String())
+	assert.Equal("65546:1000000/96", r.String())
+
+	// OpaqueExtended/40
+	buf = make([]byte, 6)
+	buf[0] = 40 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_OPAQUE) // typehigh
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:0/40", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:0/40", r.String())
 
 	// Unknown
 	buf = make([]byte, 13)
@@ -206,12 +279,28 @@ func Test_RouteTargetMembershipNLRIString(t *testing.T) {
 	r = &RouteTargetMembershipNLRI{}
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:1000000", r.String())
+	assert.Equal("65546:1000000/96", r.String())
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:1000000", r.String())
+	assert.Equal("65546:1000000/96", r.String())
+
+	// Unknown/41
+	buf = make([]byte, 7)
+	buf[0] = 41 // in bit length
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = 0xff // typehigh
+	buf[6] = 0xff
+	r = &RouteTargetMembershipNLRI{}
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:36028797018963968/41", r.String())
+	buf, err = r.Serialize()
+	assert.NoError(err)
+	err = r.decodeFromBytes(buf)
+	assert.NoError(err)
+	assert.Equal("65546:36028797018963968/41", r.String())
 
 	// Default
 	buf = make([]byte, 1)
@@ -219,18 +308,18 @@ func Test_RouteTargetMembershipNLRIString(t *testing.T) {
 	r = &RouteTargetMembershipNLRI{}
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("default", r.String())
+	assert.Equal("0:0:0/0", r.String())
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("default", r.String())
+	assert.Equal("0:0:0/0", r.String())
 	r = NewRouteTargetMembershipNLRI(0, nil)
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("default", r.String())
+	assert.Equal("0:0:0/0", r.String())
 
 	// AS only
 	buf = make([]byte, 5)
@@ -239,13 +328,279 @@ func Test_RouteTargetMembershipNLRIString(t *testing.T) {
 	r = &RouteTargetMembershipNLRI{}
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:0:0", r.String())
+	assert.Equal("65546:0:0/32", r.String())
 	r = NewRouteTargetMembershipNLRI(65546, nil)
 	buf, err = r.Serialize()
 	assert.NoError(err)
 	err = r.decodeFromBytes(buf)
 	assert.NoError(err)
-	assert.Equal("65546:0:0", r.String())
+	assert.Equal("65546:0:0/32", r.String())
+}
+
+// RFC 4684 Section 4 allows a prefix of 0 to 96 bits, and requires at least 32
+// bits for anything other than the zero-length default route target. Lengths
+// outside that make the NLRI syntactically incorrect (RFC 7606 Section 5.3), so
+// decoding must fail rather than accept a prefix that cannot be re-encoded.
+func Test_RouteTargetMembershipNLRILength(t *testing.T) {
+	assert := assert.New(t)
+	for _, tt := range []struct {
+		length uint8
+		valid  bool
+	}{
+		{0, true},
+		{1, false},
+		{16, false},
+		{31, false},
+		{32, true},
+		{64, true},
+		{95, true},
+		{96, true},
+		{97, false},
+		{104, false},
+		{200, false},
+		{255, false},
+	} {
+		// Always supply enough octets for the declared bit length so that only
+		// the length itself decides the outcome.
+		buf := make([]byte, 1+(int(tt.length)+7)/8)
+		buf[0] = tt.length
+		if len(buf) >= 13 {
+			binary.BigEndian.PutUint32(buf[1:5], 65546)
+			buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC)
+			buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+			binary.BigEndian.PutUint16(buf[7:9], 65000)
+			binary.BigEndian.PutUint32(buf[9:13], 100)
+		}
+		r := &RouteTargetMembershipNLRI{}
+		err := r.decodeFromBytes(buf)
+		if tt.valid {
+			assert.NoError(err, "length %d", tt.length)
+			continue
+		}
+		assert.Error(err, "length %d", tt.length)
+	}
+}
+
+func TestParseRouteTargetMembershipNLRI(t *testing.T) {
+	assert := assert.New(t)
+	cases := []struct {
+		in      string
+		wantStr string
+		wantAS  uint32
+		wantRT  bool
+		length  uint8
+	}{
+		{"0:0:0/0", "0:0:0/0", 0, false, 0},
+		{"0:0:0/32", "0:0:0/32", 0, false, 32},
+		{"0:0:0/96", "0:0:0/96", 0, true, 96},
+		{"65000:0:0/32", "65000:0:0/32", 65000, false, 32},
+		{"65000:65000:0/64", "65000:65000:0/64", 65000, true, 64},
+		{"65000:65000:100", "65000:65000:100/96", 65000, true, 96},
+		{"65000:65000:100/96", "65000:65000:100/96", 65000, true, 96},
+		{"65000:1.2.3.4:0/80", "65000:1.2.3.4:0/80", 65000, true, 80},
+		{"65000:1.2.3.4:100", "65000:1.2.3.4:100/96", 65000, true, 96},
+		{"65000:1.2.3.4:100/96", "65000:1.2.3.4:100/96", 65000, true, 96},
+		{"100.1000:65000:0/64", "6554600:65000:0/64", 100*65536 + 1000, true, 64},
+		{"100.1000:65000:100", "6554600:65000:100/96", 100*65536 + 1000, true, 96},
+		{"100.1000:65000:100/96", "6554600:65000:100/96", 100*65536 + 1000, true, 96},
+		{"100.1000:1.2.3.4:0/80", "6554600:1.2.3.4:0/80", 100*65536 + 1000, true, 80},
+		{"100.1000:1.2.3.4:100", "6554600:1.2.3.4:100/96", 100*65536 + 1000, true, 96},
+		{"100.1000:1.2.3.4:100/96", "6554600:1.2.3.4:100/96", 100*65536 + 1000, true, 96},
+	}
+	for _, c := range cases {
+		nlri, err := ParseRouteTargetMembershipNLRI(c.in)
+		assert.NoError(err, c.in)
+		assert.Equal(c.wantStr, nlri.String(), c.in)
+		assert.Equal(c.wantAS, nlri.AS, c.in)
+		assert.Equal(c.wantRT, nlri.RouteTarget != nil, c.in)
+		assert.Equal(c.length, nlri.Length, c.in)
+		buf, err := nlri.Serialize()
+		assert.NoError(err, c.in)
+		decoded := &RouteTargetMembershipNLRI{}
+		assert.NoError(decoded.decodeFromBytes(buf), c.in)
+		assert.Equal(c.wantStr, decoded.String(), c.in)
+	}
+	for _, in := range []string{
+		"",
+		"0:0:0/1",
+		"0:0:0/16",
+		"65000",
+		"65000:",
+		":65000:100",
+		"65000:65000:100/31",
+		"65000:65000:100/128",
+		"65000:65000:100/abc",
+		"65000:1.2.3.4:100/128",
+		"100.1000:65000:100/128",
+		"100.1000:1.2.3.4:100/128",
+	} {
+		_, err := ParseRouteTargetMembershipNLRI(in)
+		assert.Error(err, in)
+	}
+}
+
+func TestParseRTCPrefix(t *testing.T) {
+	assert := assert.New(t)
+	p1, err := ParseRTCPrefix("123:65000:100/96")
+	assert.NoError(err)
+	p2, err := ParseRTCPrefix("123:65000:100")
+	assert.NoError(err)
+	assert.Equal(p1, p2)
+	assert.Equal(96, p1.Bits())
+
+	// Masked() imitates PrefixCondition.Evaluate, which matches on r.Masked().Addr().
+	// A set key contains a path addr iff the path's covered bits match the key.
+	mk := func(s string) netip.Prefix {
+		p, err := ParseRTCPrefix(s)
+		assert.NoError(err)
+		return p.Masked()
+	}
+	p0 := mk("0:0:0/0")
+	p32 := mk("123:65000:0/32")
+	p64 := mk("123:65000:100/64")
+	p80 := mk("123:65000:100/80")
+	p96 := mk("123:65000:100/96")
+
+	assert.Equal(0, p0.Bits())
+	assert.Equal(32, p32.Bits())
+	assert.Equal(64, p64.Bits())
+	assert.Equal(80, p80.Bits())
+	assert.Equal(96, p96.Bits())
+
+	// /0 wildcard (RTC default-route) matches any RTC NLRI; "0:0:0/0" and "0:0/0" are equivalent.
+	assert.Equal(p0, mk("0:0/0"))
+	assert.True(p0.Contains(p32.Addr()))
+	assert.True(p0.Contains(p96.Addr()))
+	// /0 and /32 (AS-only ::/32) are distinct keys.
+	assert.NotEqual(p0, p32)
+
+	// /32 (origin-AS only) covers every path sharing that origin-AS, but not ::/0.
+	assert.True(p32.Contains(p64.Addr()))
+	assert.True(p32.Contains(p80.Addr()))
+	assert.True(p32.Contains(p96.Addr()))
+	assert.False(p32.Contains(p0.Addr()))
+	// A longer path addr does not contain the shorter /32 key.
+	assert.False(p64.Contains(p32.Addr()))
+
+	// /64 covers origin-AS + first 4 RT bytes (type, subtype, RT-AS). It covers the
+	// /80 and /96 paths (which extend it) but not the /32 key.
+	assert.True(p64.Contains(p80.Addr()))
+	assert.True(p64.Contains(p96.Addr()))
+	assert.False(p64.Contains(p32.Addr()))
+	// /80 covers origin-AS + 6 RT bytes; covers /96, not /32.
+	assert.True(p80.Contains(p96.Addr()))
+	assert.False(p80.Contains(p32.Addr()))
+	// /96 (full RT) covers only itself; it does not contain the masked shorter addrs,
+	// which have zeros in the host region where /96 has the RT value.
+	assert.False(p96.Contains(p64.Addr()))
+	assert.False(p96.Contains(p80.Addr()))
+	assert.False(p96.Contains(p32.Addr()))
+
+	// The TwoOctetAsSpecific value (100/200) lives in the low RT bytes, outside /64,
+	// so the two /64 keys collapse to the same masked trie key.
+	assert.Equal(p64, mk("123:65000:200/64"))
+
+	// IPv4 RT: /80 covers origin-AS + the 4-byte IPv4 address but not the 2-byte value.
+	p80ip := mk("123:1.2.3.4:100/80")
+	p96ip := mk("123:1.2.3.4:100/96")
+	assert.Equal(80, p80ip.Bits())
+	assert.True(p80ip.Contains(p96ip.Addr()))
+	assert.False(p96ip.Contains(p80ip.Addr()))
+}
+
+func TestRouteTargetKey(t *testing.T) {
+	assert := assert.New(t)
+
+	// TwoOctetAsSpecificExtended
+	buf := make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_TWO_OCTET_AS_SPECIFIC)
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint16(buf[7:9], 0x1314)
+	binary.BigEndian.PutUint32(buf[9:], 0x15161718)
+	r, err := NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	key, err := r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0x0002131415161718), key)
+
+	// IPv4AddressSpecificExtended
+	buf = make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_IP4_SPECIFIC)
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	ip := net.ParseIP("10.1.2.3").To4()
+	copy(buf[7:11], []byte(ip))
+	binary.BigEndian.PutUint16(buf[11:], 0x1314)
+	r, err = NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	key, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0x01020a0102031314), key)
+
+	// FourOctetAsSpecificExtended
+	buf = make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_FOUR_OCTET_AS_SPECIFIC)
+	buf[6] = byte(EC_SUBTYPE_ROUTE_TARGET)
+	binary.BigEndian.PutUint32(buf[7:], 0x15161718)
+	binary.BigEndian.PutUint16(buf[11:], 0x1314)
+	r, err = NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	key, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0x0202151617181314), key)
+
+	// non-Route Target
+	buf = make([]byte, 13)
+	buf[0] = 96
+	binary.BigEndian.PutUint32(buf[1:5], 65546)
+	buf[5] = byte(EC_TYPE_TRANSITIVE_OPAQUE)
+	binary.BigEndian.PutUint32(buf[9:], 1000000)
+	r, err = NLRIFromSlice(RF_RTC_UC, buf)
+	assert.NoError(err)
+	_, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NotNil(err)
+
+	// default NLRI
+	r = &RouteTargetMembershipNLRI{}
+	key, err = r.(*RouteTargetMembershipNLRI).RouteTargetKey()
+	assert.NoError(err)
+	assert.Equal(uint64(0), key)
+
+	_, err = ExtCommRouteTargetKey(nil)
+	assert.Equal(ErrNilCommunity, err)
+}
+
+func TestParseAs4Value(t *testing.T) {
+	assert := assert.New(t)
+	cases := []struct {
+		in  string
+		out uint32
+	}{
+		// asplain
+		{"0", 0},
+		{"65000", 65000},
+		{"4294967295", 4294967295},
+		// asdot (high.low)
+		{"0.0", 0},
+		{"1.0", 1 << 16},
+		{"1.1000", 1<<16 | 1000},
+		{"65535.65535", 4294967295},
+		{"100.1000", 100*65536 + 1000},
+	}
+	for _, c := range cases {
+		v, err := ParseAs4Value(c.in)
+		assert.NoError(err, c.in)
+		assert.Equal(c.out, v, c.in)
+	}
+	for _, in := range []string{"", "abc", "1.2.3", ".1", "1.", "65536.1", "1.65536", "4294967296"} {
+		_, err := ParseAs4Value(in)
+		assert.Error(err, in)
+	}
 }
 
 func Test_MalformedUpdateMsg(t *testing.T) {
@@ -930,6 +1285,62 @@ func Test_EVPNIPPrefixRouteRejectsOversizedPrefixLength(t *testing.T) {
 	assert.Error(err)
 }
 
+func Test_GetRouteDistinguisherUnknownPreservesValue(t *testing.T) {
+	assert := assert.New(t)
+	// 8-byte RD with an unrecognized type (0x0003) and a nonzero value.
+	wire := []byte{0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}
+	rd := GetRouteDistinguisher(wire)
+	buf, err := rd.Serialize()
+	assert.NoError(err)
+	assert.Equal(wire, buf)
+
+	// Two unknown RDs that differ only in their value must not collapse
+	// onto the same serialized form.
+	other := GetRouteDistinguisher([]byte{0x00, 0x03, 0xca, 0xfe, 0xba, 0xbe, 0x00, 0x02})
+	otherBuf, err := other.Serialize()
+	assert.NoError(err)
+	assert.NotEqual(buf, otherBuf)
+}
+
+func Test_RouteDistinguisherUnknownStringIncludesType(t *testing.T) {
+	assert := assert.New(t)
+
+	// The string must carry both the type and the value.
+	rd := GetRouteDistinguisher([]byte{0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})
+	assert.Equal("3:deadbeef0001", rd.String())
+
+	// EVPN, MUP, VPLS and flowspec-VPN NLRIs are keyed on String(). Two
+	// unknown RDs that differ only in their type must not produce the same
+	// key.
+	sameValueOtherType := GetRouteDistinguisher([]byte{0x00, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01})
+	assert.NotEqual(rd.String(), sameValueOtherType.String())
+
+	// The value is 12 hex digits, so it never looks like the decimal
+	// "admin:assigned" form of a known RD type.
+	known := NewRouteDistinguisherTwoOctetAS(3, 123456)
+	leadingZeros := GetRouteDistinguisher([]byte{0x00, 0x03, 0x00, 0x00, 0x00, 0x12, 0x34, 0x56})
+	assert.NotEqual(known.String(), leadingZeros.String())
+
+	// The same must hold once the RD is carried inside a real NLRI.
+	evpn := func(rdWire []byte) string {
+		return NewEVPNNLRI(EVPN_INCLUSIVE_MULTICAST_ETHERNET_TAG, &EVPNMulticastEthernetTagRoute{
+			RD:              GetRouteDistinguisher(rdWire),
+			ETag:            100,
+			IPAddressLength: 32,
+			IPAddress:       netip.MustParseAddr("10.0.0.1"),
+		}).String()
+	}
+	assert.NotEqual(
+		evpn([]byte{0x00, 0x03, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}),
+		evpn([]byte{0x00, 0x04, 0xde, 0xad, 0xbe, 0xef, 0x00, 0x01}),
+	)
+
+	// A hand-built RD with no value must not panic.
+	assert.Equal("5:", (&RouteDistinguisherUnknown{
+		DefaultRouteDistinguisher: DefaultRouteDistinguisher{Type: 5},
+	}).String())
+}
+
 func Test_EVPNMacIPAdvertisementRoute(t *testing.T) {
 	rd, err := ParseRouteDistinguisher("100:100")
 	require.NoError(t, err)
@@ -1023,7 +1434,13 @@ func Test_CapExtendedNexthop(t *testing.T) {
 	n2, err := DecodeCapability(buf1)
 	assert.NoError(err)
 
-	assert.Equal(n1, n2)
+	// Compare the wire form and the decoded tuples. A decoded capability
+	// keeps the CapLen and CapValue it read off the wire, and a capability
+	// built in memory does not, so the structs do not match.
+	buf2, err := n2.Serialize()
+	assert.NoError(err)
+	assert.Equal(buf1, buf2)
+	assert.Equal(n1.Tuples, n2.(*CapExtendedNexthop).Tuples)
 }
 
 func Test_AddPath(t *testing.T) {
@@ -4252,6 +4669,62 @@ func Test_LsNodeDescriptor(t *testing.T) {
 	}
 }
 
+func Test_LsTLVSerializeLength(t *testing.T) {
+	v4 := netip.MustParseAddr("10.0.0.1")
+	v6 := netip.MustParseAddr("2001:db8::1")
+
+	b, err := NewLsTLVLocalIPv4RouterID(&v4).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+4)
+
+	b, err = NewLsTLVRemoteIPv4RouterID(&v4).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+4)
+
+	b, err = NewLsTLVLocalIPv6RouterID(&v6).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+16)
+
+	b, err = NewLsTLVRemoteIPv6RouterID(&v6).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+16)
+
+	sid := uint32(1000002)
+	b, err = NewLsTLVPrefixSID(&sid).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+8)
+
+	attr := []byte{0xde, 0xad, 0xbe, 0xef}
+	b, err = NewLsTLVOpaquePrefixAttr(&attr).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+len(attr))
+
+	// Flags (1) + Reserved (1), then per range the Range Size (3) and a
+	// SID/Label sub-TLV carrying a 4-octet label.
+	rangeLen := 3 + tlvHdrLen + 4
+
+	caps := &LsSrCapabilities{
+		IPv4Supported: true,
+		Ranges:        []LsSrRange{{Begin: 100, End: 200}, {Begin: 1000, End: 1100}},
+	}
+	b, err = NewLsTLVSrCapabilities(caps).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+2+2*rangeLen)
+	decodedCaps := &LsTLVSrCapabilities{}
+	assert.NoError(t, decodedCaps.DecodeFromBytes(b))
+	assert.Len(t, decodedCaps.Ranges, 2)
+
+	block := &LsSrLocalBlock{
+		Ranges: []LsSrRange{{Begin: 100, End: 200}},
+	}
+	b, err = NewLsTLVSrLocalBlock(block).Serialize()
+	assert.NoError(t, err)
+	assert.Len(t, b, tlvHdrLen+2+rangeLen)
+	decodedBlock := &LsTLVSrLocalBlock{}
+	assert.NoError(t, decodedBlock.DecodeFromBytes(b))
+	assert.Len(t, decodedBlock.Ranges, 1)
+}
+
 func Test_LsAddrPrefix(t *testing.T) {
 	assert := assert.New(t)
 
@@ -5297,7 +5770,6 @@ func FuzzDecodeFromBytes(f *testing.F) {
 		(&SRv6EndpointBehaviorStructure{}).DecodeFromBytes(data)
 		(&SegmentTypeB{}).DecodeFromBytes(data)
 		(&TunnelEncapSubTLVSRSegmentList{}).DecodeFromBytes(data)
-		(&VPLSNLRI{}).decodeFromBytes(data)
 		(&TLV{}).DecodeFromBytes(data)
 		(&SubTLV{}).DecodeFromBytes(data)
 		(&SubSubTLV{}).DecodeFromBytes(data)
@@ -5317,6 +5789,14 @@ func FuzzDecodeFromBytes(f *testing.F) {
 			&SRv6InformationSubTLV{},
 			&SRv6SIDStructureSubSubTLV{},
 		)
+
+		// The VPLS NLRI has the same shape of contract: it carries a
+		// declared length, and Serialize() dereferences the route
+		// distinguisher that decoding is supposed to have set.
+		vpls := &VPLSNLRI{}
+		if vpls.decodeFromBytes(data) == nil {
+			vpls.Serialize()
+		}
 	})
 }
 
@@ -6212,4 +6692,605 @@ func Test_NewLsPrefixTLVsInvalidPrefix(t *testing.T) {
 	assert.Contains(nlri.String(), "10.1.0.0/24")
 	_, err := nlri.Serialize()
 	assert.NoError(err)
+}
+
+// getBGPUpdateAttributes was handed the attributes and the NLRI field together,
+// and it walks whatever it is given as a chain of attribute headers. Once it ran
+// off the end of the declared attribute region it read the NLRI as [flags][type]
+// [len] triplets, so a prefix in 40.0.0.0/8 registered BGP_ATTR_TYPE_PREFIX_SID
+// as present. MPLSLabelStack.DecodeFromBytes keys the bottom-of-stack rule off
+// that flag, so the same labeled prefix decodes differently depending on an
+// unrelated NLRI the peer chose.
+func Test_UpdateAttributeScanStopsAtDeclaredLength(t *testing.T) {
+	update := func(nlri []byte) []byte {
+		// MP_REACH: IPv4 labeled unicast, 10.0.0.0/8 behind a two-label stack.
+		mp := []byte{0x00, 0x01, 0x04, 0x04, 192, 0, 2, 1, 0x00}
+		mp = append(mp, 8+8*6)            // prefix bits, labels included
+		mp = append(mp, 0x00, 0x01, 0x00) // label 16, bottom-of-stack clear
+		mp = append(mp, 0x00, 0x02, 0x11) // label 33, bottom-of-stack set
+		mp = append(mp, 0x0a)             // 10.0.0.0/8
+
+		attrs := []byte{0x40, 0x01, 0x01, 0x00} // ORIGIN igp
+		attrs = append(attrs, 0x80, byte(BGP_ATTR_TYPE_MP_REACH_NLRI), byte(len(mp)))
+		attrs = append(attrs, mp...)
+
+		body := []byte{0x00, 0x00} // no withdrawn routes
+		body = binary.BigEndian.AppendUint16(body, uint16(len(attrs)))
+		body = append(body, attrs...)
+		body = append(body, nlri...)
+
+		buf := bytes.Repeat([]byte{0xff}, 16)
+		buf = binary.BigEndian.AppendUint16(buf, uint16(BGP_HEADER_LENGTH+len(body)))
+		buf = append(buf, BGP_MSG_UPDATE)
+		return append(buf, body...)
+	}
+
+	labeled := func(t *testing.T, data []byte) *LabeledIPAddrPrefix {
+		t.Helper()
+		msg, err := ParseBGPMessage(data)
+		require.NoError(t, err)
+		for _, attr := range msg.Body.(*BGPUpdate).PathAttributes {
+			if mp, ok := attr.(*PathAttributeMpReachNLRI); ok {
+				require.Len(t, mp.Value, 1)
+				return mp.Value[0].NLRI.(*LabeledIPAddrPrefix)
+			}
+		}
+		t.Fatal("no MP_REACH_NLRI in the decoded UPDATE")
+		return nil
+	}
+
+	// 0x18 0xc0 0x00 0x02 -> 192.0.2.0/24, type byte 0xc0
+	want := labeled(t, update([]byte{0x18, 192, 0, 2}))
+	// 0x18 0x28 0x01 0x02 -> 40.1.2.0/24, type byte 0x28 == BGP_ATTR_TYPE_PREFIX_SID
+	got := labeled(t, update([]byte{0x18, 40, 1, 2}))
+
+	assert.Equal(t, "10.0.0.0/8", want.Prefix.String())
+	assert.Equal(t, want.Prefix, got.Prefix)
+	assert.Equal(t, want.Labels.Labels, got.Labels.Labels)
+}
+
+func BenchmarkExtCommRouteTargetKey(b *testing.B) {
+	rt, _ := ParseRouteTarget("65000:100")
+	b.ResetTimer()
+	for range b.N {
+		_, _ = ExtCommRouteTargetKey(rt)
+	}
+}
+
+type capabilityTestCase struct {
+	name string
+	cap  ParameterCapabilityInterface
+}
+
+// capabilityLenTestCases returns one capability of every type. Add every new
+// capability type here.
+func capabilityLenTestCases() []capabilityTestCase {
+	return []capabilityTestCase{
+		{"multi-protocol", NewCapMultiProtocol(RF_IPv6_UC)},
+		{"route-refresh", NewCapRouteRefresh()},
+		{"extended-message", NewCapExtendedMessage()},
+		{"carrying-label-info", NewCapCarryingLabelInfo()},
+		{"enhanced-route-refresh", NewCapEnhancedRouteRefresh()},
+		{"route-refresh-cisco", NewCapRouteRefreshCisco()},
+		{"four-octet-as", NewCapFourOctetASNumber(65000)},
+		{"extended-nexthop", NewCapExtendedNexthop([]*CapExtendedNexthopTuple{
+			NewCapExtendedNexthopTuple(RF_IPv4_UC, uint16(AFI_IP6)),
+			NewCapExtendedNexthopTuple(RF_IPv4_VPN, uint16(AFI_IP6)),
+		})},
+		{"graceful-restart", NewCapGracefulRestart(true, true, 120, []*CapGracefulRestartTuple{
+			NewCapGracefulRestartTuple(RF_IPv4_UC, true),
+			NewCapGracefulRestartTuple(RF_IPv6_UC, false),
+		})},
+		{"add-path", NewCapAddPath([]*CapAddPathTuple{
+			NewCapAddPathTuple(RF_IPv4_UC, BGP_ADD_PATH_BOTH),
+		})},
+		{"llgr", NewCapLongLivedGracefulRestart([]*CapLongLivedGracefulRestartTuple{
+			NewCapLongLivedGracefulRestartTuple(RF_IPv4_UC, true, 3600),
+			NewCapLongLivedGracefulRestartTuple(RF_IPv6_UC, false, 10),
+		})},
+		{"fqdn", NewCapFQDN("router1", "example.com")},
+		{"software-version", NewCapSoftwareVersion("GoBGP/4.0.0")},
+		{"unknown", NewCapUnknown(BGPCapabilityCode(199), []byte{0x11, 0x22, 0x33})},
+	}
+}
+
+// TestCapabilityLenMatchesSerialize checks the invariant documented on
+// DefaultParameterCapability.Len.
+func TestCapabilityLenMatchesSerialize(t *testing.T) {
+	for _, tt := range capabilityLenTestCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			// Len must be right before Serialize has ever run. It used to
+			// return 2 until Serialize filled CapLen as a side effect.
+			l := tt.cap.Len()
+			buf, err := tt.cap.Serialize()
+			require.NoError(t, err)
+			require.Equal(t, len(buf), l)
+		})
+	}
+}
+
+func TestOptionParameterCapabilityAdvancesByWireLength(t *testing.T) {
+	// The graceful restart capability carries 6 octets of value where only
+	// the first 4 form a complete tuple. The decoder drops the trailing 2,
+	// so the capability serializes back 2 octets shorter than it arrived.
+	// The parse loop must still find the capability that follows it.
+	openBytes := []byte{
+		0x04,       // version: 4
+		0xfa, 0x7b, // my as: 64123
+		0x00, 0xf0, // hold time: 240 seconds
+		0x7f, 0x00, 0x00, 0x02, // BGP identifier: 127.0.0.2
+		0x12, // optional parameters length: 18
+		0x02, // parameter type: capability
+		0x10, // parameter length: 16
+
+		0x40,       // capability type: graceful restart
+		0x08,       // capability length: 8
+		0x00, 0x78, // flags: 0, time: 120
+		0x00, 0x01, 0x01, 0x80, // AFI: IPv4, SAFI: unicast, flags: forwarding preserved
+		0x00, 0x01, // trailing partial tuple
+
+		0x41,                   // capability type: 4-octet AS
+		0x04,                   // capability length: 4
+		0x00, 0x00, 0xfd, 0xe8, // AS 65000
+	}
+
+	open := &BGPOpen{}
+	require.NoError(t, open.DecodeFromBytes(openBytes))
+
+	require.Len(t, open.OptParams, 1)
+	param, ok := open.OptParams[0].(*OptionParameterCapability)
+	require.True(t, ok)
+	require.Len(t, param.Capability, 2)
+
+	gr, ok := param.Capability[0].(*CapGracefulRestart)
+	require.True(t, ok)
+	require.Len(t, gr.Tuples, 1)
+	// 10 octets arrived, 8 go back out.
+	require.Equal(t, 8, gr.Len())
+
+	as4, ok := param.Capability[1].(*CapFourOctetASNumber)
+	require.True(t, ok)
+	require.Equal(t, uint32(65000), as4.CapValue)
+}
+
+// capBase returns a copy of the embedded DefaultParameterCapability, which is
+// the only part of a capability that Serialize used to write to.
+func capBase(t *testing.T, c ParameterCapabilityInterface) DefaultParameterCapability {
+	t.Helper()
+	f := reflect.ValueOf(c).Elem().FieldByName("DefaultParameterCapability")
+	require.True(t, f.IsValid(), "capability has no embedded DefaultParameterCapability")
+	return f.Interface().(DefaultParameterCapability)
+}
+
+// TestCapabilitySerializeDoesNotModify checks that Serialize leaves the
+// capability alone. A capability decoded from a peer OPEN is shared by the
+// FSM, the gRPC API and the BMP clients, which serialize it concurrently.
+// Add every new capability type here.
+func TestCapabilitySerializeDoesNotModify(t *testing.T) {
+	for _, tt := range capabilityLenTestCases() {
+		t.Run(tt.name, func(t *testing.T) {
+			before := capBase(t, tt.cap)
+			for range 2 {
+				_, err := tt.cap.Serialize()
+				require.NoError(t, err)
+				require.Equal(t, before, capBase(t, tt.cap))
+			}
+		})
+	}
+}
+
+// TestBGPOpenSerializeDoesNotModify checks that serializing an OPEN leaves the
+// message alone. recvOpen is shared by the FSM, the gRPC API and the BMP
+// clients, which serialize it from their own goroutines.
+func TestBGPOpenSerializeDoesNotModify(t *testing.T) {
+	m, err := NewBGPOpenMessage(65001, 90, netip.MustParseAddr("10.0.0.1"),
+		[]OptionParameterInterface{
+			NewOptionParameterCapability([]ParameterCapabilityInterface{
+				NewCapMultiProtocol(RF_IPv4_UC),
+				NewCapRouteRefresh(),
+				NewCapFourOctetASNumber(65000),
+			}),
+			&OptionParameterUnknown{ParamType: 0xfe, Value: []byte{0x01, 0x02}},
+		})
+	require.NoError(t, err)
+	open := m.Body.(*BGPOpen)
+
+	lengths := func() []uint8 {
+		out := []uint8{open.OptParamLen}
+		for _, p := range open.OptParams {
+			switch o := p.(type) {
+			case *OptionParameterCapability:
+				out = append(out, o.ParamLen)
+			case *OptionParameterUnknown:
+				out = append(out, o.ParamLen)
+			}
+		}
+		return out
+	}
+
+	before := lengths()
+	require.Equal(t, []uint8{0, 0, 0}, before, "nothing is set before Serialize")
+
+	buf1, err := open.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, before, lengths())
+
+	buf2, err := open.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, buf1, buf2)
+	require.Equal(t, before, lengths())
+
+	// The lengths still have to reach the wire.
+	decoded := &BGPOpen{}
+	require.NoError(t, decoded.DecodeFromBytes(buf1))
+	require.Equal(t, uint8(len(buf1)-10), decoded.OptParamLen)
+	require.Len(t, decoded.OptParams, 2)
+	capParam, ok := decoded.OptParams[0].(*OptionParameterCapability)
+	require.True(t, ok)
+	require.Len(t, capParam.Capability, 3)
+	unknown, ok := decoded.OptParams[1].(*OptionParameterUnknown)
+	require.True(t, ok)
+	require.Equal(t, uint8(2), unknown.ParamLen)
+	require.Equal(t, []byte{0x01, 0x02}, unknown.Value)
+}
+
+// TestOptionParameterUnknownKeepsExplicitParamLen checks that an explicitly set
+// ParamLen still wins over len(Value).
+func TestOptionParameterUnknownKeepsExplicitParamLen(t *testing.T) {
+	o := &OptionParameterUnknown{ParamType: 0xfe, ParamLen: 4, Value: []byte{0x01, 0x02}}
+	buf, err := o.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, uint8(4), buf[1])
+	require.Equal(t, uint8(4), o.ParamLen)
+}
+
+// TestBGPMessageSerializeDoesNotModifyHeader checks that serializing a message
+// built in memory does not cache the length in the header. SentOpen is built
+// once per peer event and handed to every BMP client, which serialize it from
+// their own goroutines.
+func TestBGPMessageSerializeDoesNotModifyHeader(t *testing.T) {
+	m, err := NewBGPOpenMessage(65001, 90, netip.MustParseAddr("10.0.0.1"),
+		[]OptionParameterInterface{
+			NewOptionParameterCapability([]ParameterCapabilityInterface{
+				NewCapMultiProtocol(RF_IPv4_UC),
+			}),
+		})
+	require.NoError(t, err)
+	require.Equal(t, uint16(0), m.Header.Len)
+
+	buf1, err := m.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, uint16(0), m.Header.Len, "Serialize must not cache the length")
+	require.Equal(t, uint16(len(buf1)), binary.BigEndian.Uint16(buf1[16:18]))
+
+	buf2, err := m.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, buf1, buf2)
+	require.Equal(t, uint16(0), m.Header.Len)
+
+	// A message read off the wire keeps the length it arrived with.
+	m2, err := ParseBGPMessage(buf1)
+	require.NoError(t, err)
+	require.Equal(t, uint16(len(buf1)), m2.Header.Len)
+	buf3, err := m2.Serialize()
+	require.NoError(t, err)
+	require.Equal(t, buf1, buf3)
+	require.Equal(t, uint16(len(buf1)), m2.Header.Len)
+}
+
+// TestBGPMessageSerializeRechecksLength checks that the message size limit is
+// applied on every call. It used to be skipped once the header had a length.
+func TestBGPMessageSerializeRechecksLength(t *testing.T) {
+	body := &BGPNotification{
+		ErrorCode:    BGP_ERROR_CEASE,
+		ErrorSubcode: 0,
+		Data:         bytes.Repeat([]byte{0xCC}, 5000),
+	}
+	m := &BGPMessage{
+		Header: BGPHeader{Type: BGP_MSG_NOTIFICATION},
+		Body:   body,
+	}
+	// A successful extended serialisation used to cache the length in the
+	// header, which made every later call skip the cap.
+	_, err := m.Serialize(&MarshallingOption{ExtendedMessage: true})
+	require.NoError(t, err)
+
+	_, err = m.Serialize()
+	require.Error(t, err, "the cap must be applied on every call")
+
+	_, err = m.Serialize(&MarshallingOption{ExtendedMessage: true})
+	require.NoError(t, err)
+}
+
+// TestSerializeIsConcurrencySafe serializes one OPEN, and the capabilities
+// inside it, from several goroutines at once.
+//
+// The FSM keeps the OPEN it received in fsm.recvOpen and hands the same
+// pointer to every BMP client through watchEventPeer.RecvOpen, while toConfig
+// serializes it for the gRPC API. The capabilities travel the same way in
+// RemoteCap, and the OPEN that buildopen builds travels in SentOpen. So one
+// message is serialized by several goroutines with no lock between them.
+//
+// Run with: go test -race -count=1 ./pkg/packet/bgp/ -run TestSerializeIsConcurrencySafe
+func TestSerializeIsConcurrencySafe(t *testing.T) {
+	sent, err := NewBGPOpenMessage(65001, 90, netip.MustParseAddr("10.0.0.1"),
+		[]OptionParameterInterface{
+			NewOptionParameterCapability([]ParameterCapabilityInterface{
+				NewCapMultiProtocol(RF_IPv4_UC),
+				NewCapMultiProtocol(RF_IPv6_UC),
+				NewCapRouteRefresh(),
+				NewCapFourOctetASNumber(65001),
+				NewCapGracefulRestart(true, true, 120, []*CapGracefulRestartTuple{
+					NewCapGracefulRestartTuple(RF_IPv4_UC, true),
+				}),
+				NewCapAddPath([]*CapAddPathTuple{
+					NewCapAddPathTuple(RF_IPv4_UC, BGP_ADD_PATH_BOTH),
+				}),
+				NewCapFQDN("router1", "example.com"),
+				NewCapSoftwareVersion("GoBGP"),
+			}),
+			&OptionParameterUnknown{ParamType: 0xfe, Value: []byte{0x01, 0x02}},
+		})
+	require.NoError(t, err)
+
+	// wire is what goes out, and what a peer sends us.
+	wire, err := sent.Serialize()
+	require.NoError(t, err)
+
+	// recv stands in for fsm.recvOpen.
+	recv, err := ParseBGPMessage(wire)
+	require.NoError(t, err)
+
+	type target struct {
+		name string
+		want []byte
+		run  func() ([]byte, error)
+	}
+	targets := []target{
+		{"recv-open", wire, func() ([]byte, error) { return recv.Serialize() }},
+		{"sent-open", wire, func() ([]byte, error) { return sent.Serialize() }},
+	}
+
+	// The capabilities stand in for watchEventPeer.RemoteCap, which carries
+	// the objects decoded from the peer OPEN, not copies of them.
+	for _, p := range recv.Body.(*BGPOpen).OptParams {
+		o, ok := p.(*OptionParameterCapability)
+		if !ok {
+			continue
+		}
+		for _, c := range o.Capability {
+			want, err := c.Serialize()
+			require.NoError(t, err)
+			targets = append(targets, target{
+				name: "cap-" + strconv.Itoa(int(c.Code())),
+				want: want,
+				run:  c.Serialize,
+			})
+		}
+	}
+	require.Len(t, targets, 10)
+
+	const goroutines = 8
+	const iterations = 200
+
+	var wg sync.WaitGroup
+	for _, tt := range targets {
+		for range goroutines {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range iterations {
+					got, err := tt.run()
+					if err != nil {
+						t.Errorf("%s: %v", tt.name, err)
+						return
+					}
+					if !bytes.Equal(got, tt.want) {
+						t.Errorf("%s: serialized bytes differ between goroutines", tt.name)
+						return
+					}
+				}
+			}()
+		}
+	}
+	wg.Wait()
+}
+
+// bgpMessageHeader builds the 19-octet on-the-wire BGP header: an all-ones
+// marker, the declared total message length, then the type. The body is left
+// out because BGPHeader.DecodeFromBytes reads nothing beyond these 19 octets.
+func bgpMessageHeader(msgType uint8, declaredLen uint16) []byte {
+	buf := make([]byte, BGP_HEADER_LENGTH)
+	for i := range buf[:16] {
+		buf[i] = 0xff
+	}
+	binary.BigEndian.PutUint16(buf[16:18], declaredLen)
+	buf[18] = msgType
+	return buf
+}
+
+// TestMessageHeaderErrorData pins RFC 4271 Section 6.1: a Bad Message Length
+// NOTIFICATION must carry the erroneous Length field, and a Bad Message Type
+// NOTIFICATION must carry the erroneous Type field. Both used to be sent with
+// an empty Data field.
+func TestMessageHeaderErrorData(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   []byte
+		subCode uint8
+		data    []byte
+	}{
+		{
+			name:    "length below the header length",
+			input:   bgpMessageHeader(BGP_MSG_KEEPALIVE, BGP_HEADER_LENGTH-1),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_LENGTH,
+			data:    []byte{0x00, 0x12},
+		},
+		{
+			name:    "zero length",
+			input:   bgpMessageHeader(BGP_MSG_KEEPALIVE, 0),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_LENGTH,
+			data:    []byte{0x00, 0x00},
+		},
+		{
+			name:    "unknown message type",
+			input:   bgpMessageHeader(BGP_MSG_ROUTE_REFRESH+1, BGP_HEADER_LENGTH),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_TYPE,
+			data:    []byte{BGP_MSG_ROUTE_REFRESH + 1},
+		},
+		{
+			name:    "message type zero",
+			input:   bgpMessageHeader(0, BGP_HEADER_LENGTH),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_TYPE,
+			data:    []byte{0x00},
+		},
+		{
+			// The declared length may be legal. The caller just did
+			// not hand over that many bytes. The subcode still says
+			// Bad Message Length, so the length has to be there.
+			name:    "fewer bytes than the declared length",
+			input:   bgpMessageHeader(BGP_MSG_UPDATE, 30),
+			subCode: BGP_ERROR_SUB_BAD_MESSAGE_LENGTH,
+			data:    []byte{0x00, 0x1e},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, err := ParseBGPMessage(tt.input)
+			require.Error(t, err)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, tt.subCode, me.SubTypeCode)
+			require.Equal(t, tt.data, me.Data)
+		})
+	}
+}
+
+// TestParseBGPBodyShortBodyErrorData covers the same RFC 4271 Section 6.1 rule
+// on the path the FSM uses. ParseBGPBody is handed the header separately, so
+// it is the header length that goes in the Data field.
+func TestParseBGPBodyShortBodyErrorData(t *testing.T) {
+	h := &BGPHeader{}
+	require.NoError(t, h.DecodeFromBytes(bgpMessageHeader(BGP_MSG_UPDATE, 30)))
+
+	_, err := ParseBGPBody(h, make([]byte, 5))
+	require.Error(t, err)
+
+	var me *MessageError
+	require.ErrorAs(t, err, &me)
+	require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+	require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+	require.Equal(t, []byte{0x00, 0x1e}, me.Data)
+}
+
+// TestParseBGPMessageKeepAliveLength pins RFC 4271 Section 4.4: a KEEPALIVE is
+// header-only, so anything other than 19 octets is malformed. The decoder used
+// to accept any length and return a non-nil message with a nil error.
+func TestParseBGPMessageKeepAliveLength(t *testing.T) {
+	t.Run("exactly 19 accepted", func(t *testing.T) {
+		m, err := ParseBGPMessage(bgpMessageHeader(BGP_MSG_KEEPALIVE, BGP_HEADER_LENGTH))
+		require.NoError(t, err)
+		require.Equal(t, uint8(BGP_MSG_KEEPALIVE), m.Header.Type)
+	})
+
+	for _, declaredLen := range []uint16{20, 100, BGP_MAX_MESSAGE_LENGTH} {
+		t.Run(fmt.Sprintf("length %d rejected", declaredLen), func(t *testing.T) {
+			buf := append(bgpMessageHeader(BGP_MSG_KEEPALIVE, declaredLen),
+				make([]byte, int(declaredLen)-BGP_HEADER_LENGTH)...)
+			_, err := ParseBGPMessage(buf)
+			require.Error(t, err, "KEEPALIVE with length %d must be rejected", declaredLen)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+			require.Equal(t, binary.BigEndian.AppendUint16(nil, declaredLen), me.Data)
+		})
+	}
+}
+
+// TestParseBGPBodyLengthMismatch pins the parseBody contract: data must hold
+// exactly the body the header declares. A longer slice used to reach the body
+// decoders, which read the extra bytes as part of the message: an UPDATE gained
+// NLRI that was never sent, and a conforming KEEPALIVE was rejected with a
+// length that was never on the wire.
+func TestParseBGPBodyLengthMismatch(t *testing.T) {
+	tests := []struct {
+		name        string
+		msgType     uint8
+		declaredLen uint16
+		bodyLen     int
+	}{
+		{name: "update with trailing bytes", msgType: BGP_MSG_UPDATE, declaredLen: 23, bodyLen: 8},
+		{name: "keepalive with a body", msgType: BGP_MSG_KEEPALIVE, declaredLen: BGP_HEADER_LENGTH, bodyLen: 4},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := &BGPHeader{}
+			require.NoError(t, h.DecodeFromBytes(bgpMessageHeader(tt.msgType, tt.declaredLen)))
+
+			_, err := ParseBGPBody(h, make([]byte, tt.bodyLen))
+			require.Error(t, err)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+			require.Equal(t, binary.BigEndian.AppendUint16(nil, tt.declaredLen), me.Data)
+		})
+	}
+}
+
+// TestParseBodyMessageLengthErrorData pins the per-type length rules of RFC
+// 4271 Section 6.1: a message below the minimum length of its type is Bad
+// Message Length, and the Data field must carry the erroneous Length field.
+// The checks used to live in the body decoders, which do not know the declared
+// length, so the Data field was empty or held a length that was never sent.
+func TestParseBodyMessageLengthErrorData(t *testing.T) {
+	tests := []struct {
+		name    string
+		msgType uint8
+		bodyLen int
+	}{
+		{name: "open below the minimum length", msgType: BGP_MSG_OPEN, bodyLen: 9},
+		{name: "update below the minimum length", msgType: BGP_MSG_UPDATE, bodyLen: 3},
+		{name: "notification below the minimum length", msgType: BGP_MSG_NOTIFICATION, bodyLen: 1},
+		{name: "keepalive with a body", msgType: BGP_MSG_KEEPALIVE, bodyLen: 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			declaredLen := uint16(BGP_HEADER_LENGTH + tt.bodyLen)
+			buf := append(bgpMessageHeader(tt.msgType, declaredLen), make([]byte, tt.bodyLen)...)
+
+			_, err := ParseBGPMessage(buf)
+			require.Error(t, err)
+
+			var me *MessageError
+			require.ErrorAs(t, err, &me)
+			require.Equal(t, uint8(BGP_ERROR_MESSAGE_HEADER_ERROR), me.TypeCode)
+			require.Equal(t, uint8(BGP_ERROR_SUB_BAD_MESSAGE_LENGTH), me.SubTypeCode)
+			require.Equal(t, binary.BigEndian.AppendUint16(nil, declaredLen), me.Data)
+		})
+	}
+}
+
+// TestParseBodyRouteRefreshLengthError pins RFC 7313 Section 5: a ROUTE-REFRESH
+// of the wrong length is a ROUTE-REFRESH Message Error with the subcode Invalid
+// Message Length, not a header error, so parseBody leaves that check to the
+// body decoder.
+func TestParseBodyRouteRefreshLengthError(t *testing.T) {
+	buf := append(bgpMessageHeader(BGP_MSG_ROUTE_REFRESH, BGP_HEADER_LENGTH+3), make([]byte, 3)...)
+
+	_, err := ParseBGPMessage(buf)
+	require.Error(t, err)
+
+	var me *MessageError
+	require.ErrorAs(t, err, &me)
+	require.Equal(t, uint8(BGP_ERROR_ROUTE_REFRESH_MESSAGE_ERROR), me.TypeCode)
+	require.Equal(t, uint8(BGP_ERROR_SUB_INVALID_MESSAGE_LENGTH), me.SubTypeCode)
 }

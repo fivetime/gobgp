@@ -988,6 +988,19 @@ func newBfdConfigFromAPIStruct(a *api.BfdPeerConfig) (oc.BfdConfig, error) {
 	}, nil
 }
 
+func tcpAoConfigFromAPI(a *api.TcpAoPeerConfig) (oc.TcpAoConfig, error) {
+	if a == nil {
+		return oc.TcpAoConfig{}, nil
+	}
+	if a.SendId > 255 {
+		return oc.TcpAoConfig{}, status.Errorf(codes.InvalidArgument, "TCP-AO send ID %d is outside 0..255", a.SendId)
+	}
+	return oc.TcpAoConfig{
+		Keychain: oc.KeychainRef(a.Keychain),
+		SendId:   uint8(a.SendId),
+	}, nil
+}
+
 func newNeighborFromAPIStruct(a *api.Peer) (*oc.Neighbor, error) {
 	pconf := &oc.Neighbor{}
 	if a.Conf != nil {
@@ -1098,6 +1111,13 @@ func newNeighborFromAPIStruct(a *api.Peer) (*oc.Neighbor, error) {
 		pconf.Transport.Config.BindInterface = a.Transport.BindInterface
 		pconf.Transport.Config.TcpMss = uint16(a.Transport.TcpMss)
 		pconf.Transport.Config.IpTos = uint8(a.Transport.IpTos)
+	}
+	if a.TcpAo != nil {
+		tcpAo, err := tcpAoConfigFromAPI(a.TcpAo)
+		if err != nil {
+			return nil, err
+		}
+		pconf.TcpAo.Config = tcpAo
 	}
 	if a.EbgpMultihop != nil {
 		pconf.EbgpMultihop.Config.Enabled = a.EbgpMultihop.Enabled
@@ -1254,6 +1274,13 @@ func newPeerGroupFromAPIStruct(a *api.PeerGroup) (*oc.PeerGroup, error) {
 		pconf.Transport.Config.TcpMss = uint16(a.Transport.TcpMss)
 		pconf.Transport.Config.IpTos = uint8(a.Transport.IpTos)
 	}
+	if a.TcpAo != nil {
+		tcpAo, err := tcpAoConfigFromAPI(a.TcpAo)
+		if err != nil {
+			return nil, err
+		}
+		pconf.TcpAo.Config = tcpAo
+	}
 	if a.EbgpMultihop != nil {
 		pconf.EbgpMultihop.Config.Enabled = a.EbgpMultihop.Enabled
 		pconf.EbgpMultihop.Config.MultihopTtl = uint8(a.EbgpMultihop.MultihopTtl)
@@ -1315,13 +1342,32 @@ func (s *server) DeleteDynamicNeighbor(ctx context.Context, r *api.DeleteDynamic
 }
 
 func newPrefixFromApiStruct(a *api.Prefix) (*table.Prefix, error) {
-	prefix, err := netip.ParsePrefix(a.IpPrefix)
-	if err != nil {
-		return nil, err
+	if a.IpPrefix != "" && a.RtcPrefix != "" {
+		return nil, fmt.Errorf("ip-prefix and rtc-prefix are mutually exclusive")
 	}
-	rf := bgp.RF_IPv4_UC
-	if prefix.Addr().Is6() {
-		rf = bgp.RF_IPv6_UC
+	var (
+		prefix netip.Prefix
+		rf     bgp.Family
+		err    error
+	)
+	switch {
+	case a.IpPrefix != "":
+		prefix, err = netip.ParsePrefix(a.IpPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rf = bgp.RF_IPv4_UC
+		if prefix.Addr().Is6() {
+			rf = bgp.RF_IPv6_UC
+		}
+	case a.RtcPrefix != "":
+		prefix, err = bgp.ParseRTCPrefix(a.RtcPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rf = bgp.RF_RTC_UC
+	default:
+		return nil, fmt.Errorf("prefix requires ip-prefix or rtc-prefix")
 	}
 	return &table.Prefix{
 		Prefix:             prefix,
@@ -1332,12 +1378,32 @@ func newPrefixFromApiStruct(a *api.Prefix) (*table.Prefix, error) {
 }
 
 func newConfigPrefixFromAPIStruct(a *api.Prefix) (*oc.Prefix, error) {
-	_, prefix, err := net.ParseCIDR(a.IpPrefix)
-	if err != nil {
-		return nil, err
+	if a.IpPrefix != "" && a.RtcPrefix != "" {
+		return nil, fmt.Errorf("ip-prefix and rtc-prefix are mutually exclusive")
+	}
+	var (
+		ipPrefix  netip.Prefix
+		rtcPrefix string
+	)
+	switch {
+	case a.IpPrefix != "":
+		prefix, err := netip.ParsePrefix(a.IpPrefix)
+		if err != nil {
+			return nil, err
+		}
+		ipPrefix = prefix
+	case a.RtcPrefix != "":
+		nlri, err := bgp.ParseRouteTargetMembershipNLRI(a.RtcPrefix)
+		if err != nil {
+			return nil, err
+		}
+		rtcPrefix = nlri.String()
+	default:
+		return nil, fmt.Errorf("prefix requires ip-prefix or rtc-prefix")
 	}
 	return &oc.Prefix{
-		IpPrefix:        netip.MustParsePrefix(prefix.String()),
+		IpPrefix:        ipPrefix,
+		RtcPrefix:       rtcPrefix,
 		MasklengthRange: fmt.Sprintf("%d..%d", a.MaskLengthMin, a.MaskLengthMax),
 	}, nil
 }
@@ -2490,4 +2556,35 @@ func (s *server) GetTable(ctx context.Context, r *api.GetTableRequest) (*api.Get
 
 func (s *server) SetLogLevel(ctx context.Context, r *api.SetLogLevelRequest) (*api.SetLogLevelResponse, error) {
 	return &api.SetLogLevelResponse{}, s.bgpServer.SetLogLevel(ctx, r)
+}
+
+func (s *server) AddTcpAoKeychain(ctx context.Context, r *api.AddTcpAoKeychainRequest) (*api.AddTcpAoKeychainResponse, error) {
+	return &api.AddTcpAoKeychainResponse{}, s.bgpServer.AddTcpAoKeychain(ctx, r)
+}
+
+func (s *server) UpdateTcpAoKeychain(ctx context.Context, r *api.UpdateTcpAoKeychainRequest) (*api.UpdateTcpAoKeychainResponse, error) {
+	return s.bgpServer.UpdateTcpAoKeychain(ctx, r)
+}
+
+func (s *server) DeleteTcpAoKeychain(ctx context.Context, r *api.DeleteTcpAoKeychainRequest) (*api.DeleteTcpAoKeychainResponse, error) {
+	if err := s.bgpServer.DeleteTcpAoKeychain(ctx, r); err != nil {
+		return nil, err
+	}
+	return &api.DeleteTcpAoKeychainResponse{}, nil
+}
+
+func (s *server) ListTcpAoKeychain(r *api.ListTcpAoKeychainRequest, stream api.GoBgpService_ListTcpAoKeychainServer) error {
+	ctx, cancel := context.WithCancel(stream.Context())
+	defer cancel()
+	var sendErr error
+	fn := func(chain *api.TcpAoKeychain) {
+		if sendErr = stream.Send(&api.ListTcpAoKeychainResponse{Keychain: chain}); sendErr != nil {
+			cancel()
+		}
+	}
+	err := s.bgpServer.ListTcpAoKeychain(ctx, r, fn)
+	if sendErr != nil {
+		return sendErr
+	}
+	return err
 }

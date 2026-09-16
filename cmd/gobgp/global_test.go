@@ -67,6 +67,19 @@ func Test_ParseEvpnPath(t *testing.T) {
 	}
 }
 
+func Test_ParseEvpnIPMSIPathRequiresRouteTarget(t *testing.T) {
+	assert := assert.New(t)
+
+	path, err := parsePath(
+		bgp.RF_EVPN,
+		strings.Split("i-pmsi etag 100 rd 1.1.1.1:65000 encap vxlan pmsi ingress-repl 100 1.1.1.1", " "),
+	)
+
+	assert.Error(err)
+	assert.Nil(path)
+	assert.Contains(err.Error(), "specify rt")
+}
+
 func Test_ParseFlowSpecPath(t *testing.T) {
 	tests := []struct {
 		name        string
@@ -273,4 +286,83 @@ func Test_ParseMUPType2SessionTransformedRouteArgsMUPExtcomm(t *testing.T) {
 	assert.NoError(err)
 	want, _ := bgp.NewMUPIPv4AddressSpecificExtended(bgp.EC_SUBTYPE_MUP_INTERWORK_SEG_IPV4, netip.MustParseAddr("10.0.0.2"), 100)
 	assert.Contains(exts, bgp.ExtendedCommunityInterface(want))
+}
+
+func Test_ParseRtcArgs(t *testing.T) {
+	assert := assert.New(t)
+	tests := []struct {
+		args   string
+		asn    uint32
+		str    string
+		length uint8
+		rtNil  bool
+	}{
+		{"65000:65000:100", 65000, "65000:65000:100/96", 96, false},
+		{"65000:65000:100/96", 65000, "65000:65000:100/96", 96, false},
+		{"65000:65000:0/64", 65000, "65000:65000:0/64", 64, false},
+		{"65000:1.1.1.1:0/80", 65000, "65000:1.1.1.1:0/80", 80, false},
+		{"asn 65000 rt 65000:100", 65000, "65000:65000:100/96", 96, false},
+		{"default", 0, "0:0:0/0", 0, true},
+		{"0:0:0/0", 0, "0:0:0/0", 0, true},
+		{"0:0:0", 0, "0:0:0/96", 96, false},
+	}
+	for _, tt := range tests {
+		t.Run("RtcArgs/"+tt.args, func(t *testing.T) {
+			nlri, err := parseRtcArgs(strings.Split(tt.args, " "))
+			assert.NoError(err)
+			r := nlri.(*bgp.RouteTargetMembershipNLRI)
+			assert.Equal(tt.asn, r.AS)
+			assert.Equal(tt.str, r.String())
+			assert.Equal(tt.length, r.Length)
+			assert.Equal(tt.rtNil, r.RouteTarget == nil)
+		})
+	}
+}
+
+func Test_ParseFlowSpecRedirectToIP(t *testing.T) {
+	assert := assert.New(t)
+
+	for _, tc := range []struct {
+		name string
+		args string
+		copy bool
+		want string
+	}{
+		{"IPv4", "redirect-to-ip 198.51.100.11", false, "redirect-to-ip: 198.51.100.11"},
+		{"IPv4 copy", "redirect-to-ip 198.51.100.11 copy", true, "copy-to-ip: 198.51.100.11"},
+		{"IPv6", "redirect-to-ip 2001:db8:1::1", false, "redirect-to-ip: 2001:db8:1::1"},
+		{"IPv6 copy", "redirect-to-ip 2001:db8:1::1 copy", true, "copy-to-ip: 2001:db8:1::1"},
+		{"IPv4-mapped is an IPv4 target", "redirect-to-ip ::ffff:198.51.100.11", false, "redirect-to-ip: 198.51.100.11"},
+	} {
+		exts, err := parseExtendedCommunities(strings.Split(tc.args, " "))
+		assert.NoError(err, tc.name)
+		assert.Len(exts, 1, tc.name)
+		switch e := exts[0].(type) {
+		case *bgp.FlowSpecRedirectToIPv4Extended:
+			assert.Equal(tc.copy, e.IsCopy(), tc.name)
+			assert.Equal(tc.want, e.String(), tc.name)
+		case *bgp.FlowSpecRedirectToIPv6Extended:
+			assert.Equal(tc.copy, e.IsCopy(), tc.name)
+			assert.Equal(tc.want, e.String(), tc.name)
+		default:
+			assert.Fail("unexpected type", "%s: %T", tc.name, exts[0])
+		}
+	}
+
+	for _, bad := range []string{
+		"redirect-to-ip",
+		"redirect-to-ip not-an-address",
+		"redirect-to-ip 198.51.100.11 mirror",
+		"redirect-to-ip 198.51.100.11 copy extra",
+	} {
+		_, err := parseExtendedCommunities(strings.Split(bad, " "))
+		assert.Error(err, bad)
+	}
+
+	// "redirect" must keep meaning rt-redirect.
+	exts, err := parseExtendedCommunities(strings.Split("redirect 10.0.0.1:100", " "))
+	assert.NoError(err)
+	assert.Len(exts, 1)
+	_, isNew := exts[0].(*bgp.FlowSpecRedirectToIPv4Extended)
+	assert.False(isNew, "plain redirect must not produce the redirect-to-ip action")
 }

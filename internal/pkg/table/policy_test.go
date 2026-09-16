@@ -50,6 +50,205 @@ func TestGetPolicy(t *testing.T) {
 	assert.Equal(t, len(r.GetPolicy("unknown")), 0)
 }
 
+func TestDeletePolicyPreserve(t *testing.T) {
+	r := NewRoutingPolicy(logger)
+
+	statements := []*Statement{
+		{Name: "st1"},
+		{Name: "st2"},
+		{Name: "st3"},
+		{Name: "st4"},
+		{Name: "st5"},
+	}
+
+	for _, st := range statements {
+		err := r.AddStatement(st)
+		require.NoError(t, err)
+	}
+
+	policies := []*Policy{
+		{
+			Name: "p1",
+			Statements: []*Statement{
+				{Name: "st1"},
+				{Name: "st2"},
+				{Name: "st3"},
+			},
+		},
+		{
+			Name: "p2",
+			Statements: []*Statement{
+				{Name: "st2"},
+				{Name: "st3"},
+			},
+		},
+		{
+			Name: "p3",
+			Statements: []*Statement{
+				{Name: "st4"},
+			},
+		},
+		{
+			Name: "p4",
+			Statements: []*Statement{
+				{Name: "st5"},
+			},
+		},
+	}
+
+	for _, p := range policies {
+		err := r.AddPolicy(p, true)
+		require.NoError(t, err)
+	}
+
+	policy := &Policy{
+		Name: "p1",
+		Statements: []*Statement{
+			{Name: "st1"},
+			{Name: "st2"},
+		},
+	}
+	err := r.DeletePolicy(policy, false, false)
+	require.NoError(t, err)
+
+	assert.Len(t, r.GetStatement("st1"), 0, "preserve=false")
+	assert.Len(t, r.GetStatement("st2"), 1, "p2 still uses st2")
+
+	policy = &Policy{
+		Name: "p2",
+	}
+	err = r.DeletePolicy(policy, true, false)
+	require.NoError(t, err)
+
+	assert.Len(t, r.GetStatement("st2"), 0, "preserve=false")
+	assert.Len(t, r.GetStatement("st3"), 1, "p1 still uses st3")
+
+	policy = &Policy{
+		Name:       "p3",
+		Statements: []*Statement{{Name: "st4"}},
+	}
+	err = r.DeletePolicy(policy, false, true)
+	require.NoError(t, err)
+
+	assert.Len(t, r.GetStatement("st4"), 1, "preserve=true")
+
+	policy = &Policy{
+		Name: "p4",
+	}
+	err = r.DeletePolicy(policy, true, true)
+	require.NoError(t, err)
+
+	assert.Len(t, r.GetStatement("st5"), 1, "preserve=true")
+}
+
+func TestDeletePolicyUnknownStatement(t *testing.T) {
+	r := NewRoutingPolicy(logger)
+
+	for _, name := range []string{"st1", "st2", "lone"} {
+		err := r.AddStatement(&Statement{Name: name})
+		require.NoError(t, err)
+	}
+
+	err := r.AddPolicy(&Policy{
+		Name:       "p1",
+		Statements: []*Statement{{Name: "st1"}, {Name: "st2"}},
+	}, true)
+	require.NoError(t, err)
+
+	// "lone" is in the statement pool but p1 does not use it.
+	err = r.DeletePolicy(&Policy{
+		Name:       "p1",
+		Statements: []*Statement{{Name: "lone"}},
+	}, false, false)
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "lone")
+
+	assert.Len(t, r.GetPolicy("p1")[0].Statements, 2, "p1 must not change")
+	assert.Len(t, r.GetStatement("lone"), 1, "lone must not be deleted")
+
+	// A statement that p1 does use is still removed.
+	err = r.DeletePolicy(&Policy{
+		Name:       "p1",
+		Statements: []*Statement{{Name: "st1"}},
+	}, false, false)
+	require.NoError(t, err)
+
+	assert.Len(t, r.GetPolicy("p1")[0].Statements, 1)
+	assert.Len(t, r.GetStatement("st1"), 0)
+}
+
+func TestDeletePeerPolicy(t *testing.T) {
+	r := NewRoutingPolicy(logger)
+
+	err := r.AddPolicy(&Policy{Name: "p1"}, true)
+	require.NoError(t, err)
+
+	id := "10.0.0.1"
+	err = r.AddPolicyAssignment(id, POLICY_DIRECTION_IMPORT, []*oc.PolicyDefinition{{Name: "p1"}}, ROUTE_TYPE_ACCEPT)
+	require.NoError(t, err)
+
+	_, ps, err := r.GetPolicyAssignment(id, POLICY_DIRECTION_IMPORT)
+	require.NoError(t, err)
+	assert.Len(t, ps, 1)
+
+	r.DeletePeerPolicy(id)
+
+	_, ps, err = r.GetPolicyAssignment(id, POLICY_DIRECTION_IMPORT)
+	require.NoError(t, err)
+	assert.Len(t, ps, 0, "the assignment must be gone")
+
+	// The global assignment is not touched.
+	err = r.AddPolicyAssignment(GLOBAL_RIB_NAME, POLICY_DIRECTION_IMPORT, []*oc.PolicyDefinition{{Name: "p1"}}, ROUTE_TYPE_ACCEPT)
+	require.NoError(t, err)
+	r.DeletePeerPolicy(id)
+	_, ps, err = r.GetPolicyAssignment(GLOBAL_RIB_NAME, POLICY_DIRECTION_IMPORT)
+	require.NoError(t, err)
+	assert.Len(t, ps, 1)
+}
+
+func TestDeletePolicyInUse(t *testing.T) {
+	newPolicy := func(t *testing.T) *RoutingPolicy {
+		r := NewRoutingPolicy(logger)
+
+		err := r.AddStatement(&Statement{Name: "st1"})
+		require.NoError(t, err)
+
+		err = r.AddPolicy(&Policy{
+			Name:       "p1",
+			Statements: []*Statement{{Name: "st1"}},
+		}, true)
+		require.NoError(t, err)
+
+		return r
+	}
+
+	for _, id := range []string{GLOBAL_RIB_NAME, "10.0.0.1"} {
+		for _, dir := range []PolicyDirection{POLICY_DIRECTION_IMPORT, POLICY_DIRECTION_EXPORT} {
+			t.Run(id+"/"+dir.String(), func(t *testing.T) {
+				r := newPolicy(t)
+
+				err := r.AddPolicyAssignment(id, dir, []*oc.PolicyDefinition{{Name: "p1"}}, ROUTE_TYPE_ACCEPT)
+				require.NoError(t, err)
+
+				err = r.DeletePolicy(&Policy{Name: "p1"}, true, true)
+				require.Error(t, err, "an assigned policy must not be deleted")
+				assert.Contains(t, err.Error(), "in use")
+
+				assert.Len(t, r.GetPolicy("p1"), 1, "the policy must still exist")
+			})
+		}
+	}
+
+	t.Run("not assigned", func(t *testing.T) {
+		r := newPolicy(t)
+
+		err := r.DeletePolicy(&Policy{Name: "p1"}, true, true)
+		require.NoError(t, err)
+
+		assert.Len(t, r.GetPolicy("p1"), 0)
+	})
+}
+
 func TestPrefixCalcurateNoRange(t *testing.T) {
 	// create path
 	peer := &PeerInfo{AS: 65001, Address: netip.MustParseAddr("10.0.0.1")}
@@ -369,6 +568,35 @@ func TestPolicyRejectOnlyPrefixSet(t *testing.T) {
 	pType2, newPath2 := p.Apply(logger, path2, nil)
 	assert.Equal(t, ROUTE_TYPE_NONE, pType2)
 	assert.Equal(t, newPath2, path2)
+
+	// rtc-prefix-set: reject the matching RTC NLRI, pass the non-matching one.
+	rtcPs := oc.PrefixSet{
+		PrefixSetName: "ps2",
+		PrefixList: []oc.Prefix{{
+			RtcPrefix:       "65001:65000:100/96",
+			MasklengthRange: "96..96",
+		}},
+	}
+	ds2 := oc.DefinedSets{PrefixSets: []oc.PrefixSet{rtcPs}}
+	s2 := createStatement("statement2", "ps2", "", false)
+	pd2 := createPolicyDefinition("pd2", s2)
+	pl2 := createRoutingPolicy(ds2, pd2)
+	r2 := NewRoutingPolicy(logger)
+	err = r2.reload(pl2)
+	assert.NoError(t, err)
+	p2 := r2.policyMap["pd2"]
+
+	rt, _ := bgp.ParseRouteTarget("65000:100")
+	rtcMatch := NewPath(bgp.RF_RTC_UC, peer, bgp.PathNLRI{NLRI: bgp.NewRouteTargetMembershipNLRI(65001, rt)}, false, []bgp.PathAttributeInterface{}, time.Now(), false)
+	pType3, newPath3 := p2.Apply(logger, rtcMatch, nil)
+	assert.Equal(t, ROUTE_TYPE_REJECT, pType3)
+	assert.Equal(t, newPath3, rtcMatch)
+
+	rt2, _ := bgp.ParseRouteTarget("65000:200")
+	rtcNoMatch := NewPath(bgp.RF_RTC_UC, peer, bgp.PathNLRI{NLRI: bgp.NewRouteTargetMembershipNLRI(65001, rt2)}, false, []bgp.PathAttributeInterface{}, time.Now(), false)
+	pType4, newPath4 := p2.Apply(logger, rtcNoMatch, nil)
+	assert.Equal(t, ROUTE_TYPE_NONE, pType4)
+	assert.Equal(t, newPath4, rtcNoMatch)
 }
 
 func TestPolicyRejectOnlyNeighborSet(t *testing.T) {
@@ -3885,6 +4113,105 @@ func TestPrefixSetMatchVPNV6Prefix(t *testing.T) {
 	assert.False(t, m.Evaluate(path, nil))
 }
 
+// TestPrefixSetMatchRtcPrefix exercises rtc-prefix matching across the
+// origin-as × route-target matrix at depths /0, /32, /64, /80, /96.
+func TestPrefixSetMatchRtcPrefix(t *testing.T) {
+	rtm := func(as uint32, rt string) *bgp.RouteTargetMembershipNLRI {
+		r, err := bgp.ParseRouteTarget(rt)
+		assert.NoError(t, err)
+		return bgp.NewRouteTargetMembershipNLRI(as, r)
+	}
+	cases := []struct {
+		rtcPrefix string
+		maskRange string
+		nlri      bgp.NLRI
+		want      bool
+	}{
+		// /0 matches any RTC NLRI.
+		{"0:0:0/0", "0..96", bgp.NewRouteTargetMembershipNLRI(0, nil), true},
+		{"0:0:0/0", "0..96", rtm(123, "65000:100"), true},
+		// /32: origin-as only.
+		{"123:65000:0/32", "96..96", rtm(123, "65000:100"), true},
+		{"123:65000:0/32", "96..96", rtm(123, "65001:200"), true},
+		{"123:65000:0/32", "96..96", rtm(999, "65000:100"), false},
+		{"123:65000:0/32", "32..32", bgp.NewRouteTargetMembershipNLRI(123, nil), true},
+		// 4-octet origin-as: 6500000 == 100.1000 == 6554600.
+		{"6500000:65000:0/32", "96..96", rtm(6500000, "65000:100"), true},
+		{"100.1000:65000:0/32", "96..96", rtm(100*65536+1000, "65000:100"), true},
+		// /64: origin-as + 2-octet RT AS (local-admin ignored).
+		{"123:65000:0/64", "96..96", rtm(123, "65000:200"), true},
+		{"123:65000:0/64", "96..96", rtm(123, "65001:200"), false},
+		// /80: 4-octet/IPv4 RT keep full AS, local-admin ignored.
+		{"123:100.1000:0/80", "96..96", rtm(123, "100.1000:200"), true},
+		{"123:1.2.3.4:0/80", "96..96", rtm(123, "1.2.3.4:200"), true},
+		// /96 exact.
+		{"123:65000:100/96", "96..96", rtm(123, "65000:100"), true},
+		{"123:65000:100/96", "96..96", rtm(123, "65000:200"), false},
+		{"123:1.2.3.4:100/96", "96..96", rtm(123, "1.2.3.4:100"), true},
+		{"123:1.2.3.4:100/96", "96..96", rtm(123, "1.2.3.5:100"), false},
+		{"123:100.1000:100/96", "96..96", rtm(123, "100.1000:100"), true},
+		// no /n defaults to /96.
+		{"123:65000:100", "96..96", rtm(123, "65000:100"), true},
+		{"123:65000:100", "96..96", rtm(123, "65000:200"), false},
+		{"123:65000:100", "32..32", rtm(123, "65000:100"), false},
+	}
+	for _, c := range cases {
+		t.Run(c.rtcPrefix+" "+c.maskRange, func(t *testing.T) {
+			ps, err := NewPrefixSet(oc.PrefixSet{
+				PrefixSetName: "ps1",
+				PrefixList:    []oc.Prefix{{RtcPrefix: c.rtcPrefix, MasklengthRange: c.maskRange}},
+			})
+			assert.NoError(t, err)
+			m := &PrefixCondition{set: ps}
+			path := NewPath(bgp.RF_RTC_UC, nil, bgp.PathNLRI{NLRI: c.nlri}, false, []bgp.PathAttributeInterface{}, time.Now(), false)
+			assert.Equal(t, c.want, m.Evaluate(path, nil))
+		})
+	}
+
+	// IPv4 path must not match an RTC set despite shared AFI_IP.
+	ps, err := NewPrefixSet(oc.PrefixSet{
+		PrefixSetName: "ps1",
+		PrefixList:    []oc.Prefix{{RtcPrefix: "0:0:0/0", MasklengthRange: "0..96"}},
+	})
+	assert.NoError(t, err)
+	nlri, _ := bgp.NewIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24"))
+	path := NewPath(bgp.RF_IPv4_UC, nil, bgp.PathNLRI{NLRI: nlri}, false, []bgp.PathAttributeInterface{}, time.Now(), false)
+	assert.False(t, (&PrefixCondition{set: ps}).Evaluate(path, nil))
+}
+
+func TestPrefixSetRtcRejectMixedFamily(t *testing.T) {
+	_, err := NewPrefixSet(oc.PrefixSet{
+		PrefixSetName: "ps1",
+		PrefixList: []oc.Prefix{
+			{IpPrefix: netip.MustParsePrefix("10.10.10.0/24")},
+			{RtcPrefix: "123:65000:100/96"},
+		},
+	})
+	assert.NotNil(t, err)
+
+	_, _, err = (&oc.Prefix{IpPrefix: netip.MustParsePrefix("10.10.10.0/24"), RtcPrefix: "123:65000:100/96"}).ToPrefix()
+	assert.NotNil(t, err)
+}
+
+func TestPrefixSetRtcRoundTrip(t *testing.T) {
+	ps, err := NewPrefixSet(oc.PrefixSet{
+		PrefixSetName: "ps1",
+		PrefixList: []oc.Prefix{
+			{RtcPrefix: "65000:65000:100/96", MasklengthRange: "96..96"},
+			{RtcPrefix: "123:65000:100/64", MasklengthRange: "64..96"},
+		},
+	})
+	assert.NoError(t, err)
+	cfg := ps.ToConfig()
+	assert.Len(t, cfg.PrefixList, 2)
+	// Host bits beyond /64 are kept (as for ip-prefix), so the value (100) round-trips.
+	assert.Equal(t, "123:65000:100/64", cfg.PrefixList[0].RtcPrefix)
+	assert.Equal(t, "64..96", cfg.PrefixList[0].MasklengthRange)
+	assert.Equal(t, "65000:65000:100/96", cfg.PrefixList[1].RtcPrefix)
+	assert.False(t, cfg.PrefixList[1].IpPrefix.IsValid())
+	assert.Equal(t, "96..96", cfg.PrefixList[1].MasklengthRange)
+}
+
 func TestLargeCommunityMatchAction(t *testing.T) {
 	coms := []*bgp.LargeCommunity{
 		{ASN: 100, LocalData1: 100, LocalData2: 100},
@@ -4080,4 +4407,57 @@ func TestNewSingleAsPathMatch(t *testing.T) {
 	assert.Equal(t, r.mode, INCLUDE)
 	r = NewSingleAsPathMatch("^65100$")
 	assert.Equal(t, r.mode, ONLY)
+}
+
+func BenchmarkPrefixConditionEvaluate(b *testing.B) {
+	rt, _ := bgp.ParseRouteTarget("65000:100")
+	cases := []struct {
+		name   string
+		set    oc.PrefixSet
+		family bgp.Family
+		nlri   bgp.NLRI
+	}{
+		{
+			name:   "IPv4",
+			family: bgp.RF_IPv4_UC,
+			set: oc.PrefixSet{PrefixSetName: "v4", PrefixList: []oc.Prefix{
+				{IpPrefix: netip.MustParsePrefix("10.0.0.0/8"), MasklengthRange: "8..32"},
+				{IpPrefix: netip.MustParsePrefix("0.0.0.0/0"), MasklengthRange: "0..32"},
+			}},
+			nlri: mustIPAddrPrefix(netip.MustParsePrefix("10.10.10.0/24")),
+		},
+		{
+			name:   "IPv6",
+			family: bgp.RF_IPv6_UC,
+			set: oc.PrefixSet{PrefixSetName: "v6", PrefixList: []oc.Prefix{
+				{IpPrefix: netip.MustParsePrefix("2001:db8::/32"), MasklengthRange: "32..128"},
+				{IpPrefix: netip.MustParsePrefix("::/0"), MasklengthRange: "0..128"},
+			}},
+			nlri: mustIPAddrPrefix(netip.MustParsePrefix("2001:db8::/64")),
+		},
+		{
+			name:   "RTC",
+			family: bgp.RF_RTC_UC,
+			set: oc.PrefixSet{PrefixSetName: "rtc", PrefixList: []oc.Prefix{
+				{RtcPrefix: "65000:65000:100/96", MasklengthRange: "96..96"},
+				{RtcPrefix: "65000:65000:0/32", MasklengthRange: "32..96"},
+				{RtcPrefix: "0:0:0/0", MasklengthRange: "0..96"},
+			}},
+			nlri: bgp.NewRouteTargetMembershipNLRI(65000, rt),
+		},
+	}
+	for _, c := range cases {
+		b.Run(c.name, func(b *testing.B) {
+			ps, err := NewPrefixSet(c.set)
+			if err != nil {
+				b.Fatal(err)
+			}
+			m := &PrefixCondition{set: ps}
+			path := NewPath(c.family, nil, bgp.PathNLRI{NLRI: c.nlri}, false, []bgp.PathAttributeInterface{}, time.Now(), false)
+			b.ResetTimer()
+			for range b.N {
+				_ = m.Evaluate(path, nil)
+			}
+		})
+	}
 }

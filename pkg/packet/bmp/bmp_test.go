@@ -16,6 +16,7 @@
 package bmp
 
 import (
+	"encoding/binary"
 	"net/netip"
 	"testing"
 
@@ -25,11 +26,17 @@ import (
 )
 
 func verify(t *testing.T, m1 *BMPMessage) {
-	buf1, _ := m1.Serialize()
+	buf1, err := m1.Serialize()
+	require.NoError(t, err)
 	m2, err := ParseBMPMessage(buf1)
 	require.NoError(t, err)
 
-	assert.Equal(t, m1, m2)
+	// Compare the wire form, not the two structs. A decoded message keeps
+	// the length fields it read off the wire, and a message built in memory
+	// does not, so the structs do not match.
+	buf2, err := m2.Serialize()
+	require.NoError(t, err)
+	assert.Equal(t, buf1, buf2)
 }
 
 func Test_Initiation(t *testing.T) {
@@ -168,7 +175,12 @@ func Test_RouteMonitoringAddPath(t *testing.T) {
 	u2 := m2.Body.(*BMPRouteMonitoring).BGPUpdate.Body.(*bgp.BGPUpdate).NLRI[0]
 	assert.Equal(t, u2.ID, uint32(10))
 
-	assert.Equal(t, m1, m2)
+	// Compare the wire form, not the two structs. The decoded BGP UPDATE
+	// keeps the length it read off the wire, and the one built in memory
+	// does not.
+	buf2, err := m2.Serialize(opt)
+	require.NoError(t, err)
+	assert.Equal(t, buf1, buf2)
 }
 
 func Test_StatisticsReport(t *testing.T) {
@@ -258,4 +270,49 @@ func FuzzDecodeFromBytes(f *testing.F) {
 		(&BMPHeader{}).DecodeFromBytes(data)
 		(&BMPPeerHeader{}).DecodeFromBytes(data)
 	})
+}
+
+func Test_RouteMirroringBGPMsgTLVHonoursItsLength(t *testing.T) {
+	// The BGP Message TLV carries a complete BGP message inside its own
+	// value. Its parser handed the whole remainder of the body to
+	// ParseBGPMessage instead of the Length octets it declared, so the
+	// embedded BGP header's own length field decided where the mirrored
+	// message ended. A message announcing more octets than the TLV holds
+	// was decoded out of the bytes that follow it.
+
+	// A 19-octet KEEPALIVE-shaped header whose length field claims 23.
+	// The 4 extra octets it asks for are the next TLV's header.
+	mirrored := make([]byte, 19)
+	for i := range 16 {
+		mirrored[i] = 0xff
+	}
+	binary.BigEndian.PutUint16(mirrored[16:18], 23)
+	mirrored[18] = bgp.BGP_MSG_ROUTE_REFRESH
+
+	data := []byte{0x00, 0x00, 0x00, 0x13} // type=BGP Message(0), length=19
+	data = append(data, mirrored...)
+	// Information TLV: type=1, length=2, value=0x0001 (message lost).
+	data = append(data, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01)
+
+	body := &BMPRouteMirroring{}
+	require.Error(t, body.ParseBody(nil, data))
+
+	// A mirrored message that fits inside its TLV still decodes, and the
+	// TLV that follows it is parsed on its own.
+	rr, err := bgp.NewBGPRouteRefreshMessage(1, 0, 1).Serialize()
+	require.NoError(t, err)
+	require.Len(t, rr, 23)
+	good := []byte{0x00, 0x00, 0x00, 0x17}
+	good = append(good, rr...)
+	good = append(good, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01)
+
+	body = &BMPRouteMirroring{}
+	require.NoError(t, body.ParseBody(nil, good))
+	require.Len(t, body.Info, 2)
+	msg, ok := body.Info[0].(*BMPRouteMirrTLVBGPMsg)
+	require.True(t, ok)
+	require.Equal(t, uint8(bgp.BGP_MSG_ROUTE_REFRESH), msg.Value.Header.Type)
+	info, ok := body.Info[1].(*BMPRouteMirrTLV16)
+	require.True(t, ok)
+	require.Equal(t, uint16(BMP_ROUTE_MIRRORING_INFO_MSG_LOST), info.Value)
 }

@@ -16,6 +16,7 @@ import (
 	"github.com/osrg/gobgp/v4/pkg/config/oc"
 	"github.com/osrg/gobgp/v4/pkg/packet/bgp"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 )
@@ -72,6 +73,75 @@ func TestNewPeerGroupFromAPIStructRejectsInvalidAllowOwnAsn(t *testing.T) {
 		},
 	})
 	assert.ErrorContains(t, err, "allow_own_asn is out of range")
+}
+
+func TestNewNeighborFromAPIStructTcpAo(t *testing.T) {
+	newNeighbor := func(t *testing.T, tcpAo *api.TcpAoPeerConfig) (*oc.Neighbor, error) {
+		t.Helper()
+		return newNeighborFromAPIStruct(&api.Peer{
+			Conf: &api.PeerConf{
+				NeighborAddress: "192.0.2.1",
+				PeerAsn:         65001,
+			},
+			TcpAo: tcpAo,
+		})
+	}
+
+	t.Run("keychain_and_send_id", func(t *testing.T) {
+		pconf, err := newNeighbor(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 3})
+		require.NoError(t, err)
+		assert.Equal(t, oc.KeychainRef("fabric"), pconf.TcpAo.Config.Keychain)
+		assert.Equal(t, uint8(3), pconf.TcpAo.Config.SendId)
+	})
+
+	// RFC 5925 section 3.1 requires every MKT ID from 0 to 255 to be
+	// supported, so both ends of that range must survive the conversion.
+	t.Run("send_id_bounds", func(t *testing.T) {
+		for _, sendID := range []uint32{0, 255} {
+			pconf, err := newNeighbor(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: sendID})
+			require.NoError(t, err)
+			assert.Equal(t, uint8(sendID), pconf.TcpAo.Config.SendId)
+		}
+	})
+
+	t.Run("send_id_out_of_range", func(t *testing.T) {
+		_, err := newNeighbor(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 256})
+		assert.ErrorContains(t, err, "outside 0..255")
+	})
+
+	t.Run("no_tcp_ao", func(t *testing.T) {
+		pconf, err := newNeighbor(t, nil)
+		require.NoError(t, err)
+		assert.Equal(t, oc.TcpAoConfig{}, pconf.TcpAo.Config)
+	})
+}
+
+func TestNewPeerGroupFromAPIStructTcpAo(t *testing.T) {
+	newPeerGroup := func(t *testing.T, tcpAo *api.TcpAoPeerConfig) (*oc.PeerGroup, error) {
+		t.Helper()
+		return newPeerGroupFromAPIStruct(&api.PeerGroup{
+			Conf:  &api.PeerGroupConf{PeerGroupName: "pg"},
+			TcpAo: tcpAo,
+		})
+	}
+
+	t.Run("keychain_and_send_id", func(t *testing.T) {
+		pconf, err := newPeerGroup(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 7})
+		require.NoError(t, err)
+		assert.Equal(t, oc.KeychainRef("fabric"), pconf.TcpAo.Config.Keychain)
+		assert.Equal(t, uint8(7), pconf.TcpAo.Config.SendId)
+	})
+
+	t.Run("send_id_out_of_range", func(t *testing.T) {
+		_, err := newPeerGroup(t, &api.TcpAoPeerConfig{Keychain: "fabric", SendId: 256})
+		assert.ErrorContains(t, err, "outside 0..255")
+	})
+
+	t.Run("no_tcp_ao", func(t *testing.T) {
+		pconf, err := newPeerGroup(t, nil)
+		require.NoError(t, err)
+		assert.Equal(t, oc.TcpAoConfig{}, pconf.TcpAo.Config)
+	})
 }
 
 func TestToPathApi(t *testing.T) {
@@ -600,4 +670,61 @@ func TestNewCommunityCountConditionFromApiStruct(t *testing.T) {
 			t.Fatalf("operator mismatch: got %q want prefix %q", got, tt.wantOp)
 		}
 	}
+}
+
+func TestNewConfigPrefixFromAPIStruct(t *testing.T) {
+	c, err := newConfigPrefixFromAPIStruct(&api.Prefix{IpPrefix: "10.1.2.3/24", MaskLengthMin: 24, MaskLengthMax: 24})
+	assert.NoError(t, err)
+	assert.Equal(t, "10.1.2.3/24", c.IpPrefix.String())
+	assert.Equal(t, "", c.RtcPrefix)
+	assert.Equal(t, "24..24", c.MasklengthRange)
+
+	// rtc-prefix is canonicalized (dotted AS -> asplain, /0 -> 0:0:0/0).
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "100.1000:65000:100/80", MaskLengthMin: 80, MaskLengthMax: 80})
+	assert.NoError(t, err)
+	assert.Equal(t, "6554600:65000:100/80", c.RtcPrefix)
+	assert.False(t, c.IpPrefix.IsValid())
+
+	// A length-less rtc-prefix is accepted on input and canonicalized to /96.
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "65000:65000:100", MaskLengthMin: 96, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, "65000:65000:100/96", c.RtcPrefix)
+
+	// /0 wildcard (RTC default-route) keeps the caller's mask range.
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "0:0:0/0", MaskLengthMin: 0, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, "0:0:0/0", c.RtcPrefix)
+	assert.False(t, c.IpPrefix.IsValid())
+	assert.Equal(t, "0..96", c.MasklengthRange)
+	c, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "0:0/0", MaskLengthMin: 0, MaskLengthMax: 0})
+	assert.NoError(t, err)
+	assert.Equal(t, "0:0:0/0", c.RtcPrefix)
+
+	_, err = newConfigPrefixFromAPIStruct(&api.Prefix{IpPrefix: "10.0.0.0/8", RtcPrefix: "65000:65000:100/96"})
+	assert.NotNil(t, err)
+	_, err = newConfigPrefixFromAPIStruct(&api.Prefix{})
+	assert.NotNil(t, err)
+	_, err = newConfigPrefixFromAPIStruct(&api.Prefix{RtcPrefix: "65000:65000"})
+	assert.NotNil(t, err)
+}
+
+func TestNewPrefixFromApiStructRTC(t *testing.T) {
+	p, err := newPrefixFromApiStruct(&api.Prefix{RtcPrefix: "65000:65000:100/96", MaskLengthMin: 96, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, bgp.RF_RTC_UC, p.AddressFamily)
+	assert.Equal(t, uint8(96), p.MasklengthRangeMin)
+	assert.Equal(t, uint8(96), p.MasklengthRangeMax)
+	assert.Equal(t, "65000:65000:100/96", p.PrefixString())
+
+	// /0 wildcard maps to ::/0 and matches any RTC NLRI.
+	p, err = newPrefixFromApiStruct(&api.Prefix{RtcPrefix: "0:0:0/0", MaskLengthMin: 0, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.Equal(t, bgp.RF_RTC_UC, p.AddressFamily)
+	assert.Equal(t, uint8(0), p.MasklengthRangeMin)
+	assert.Equal(t, uint8(96), p.MasklengthRangeMax)
+	assert.Equal(t, "::/0", p.Prefix.String())
+	assert.Equal(t, "0:0:0/0", p.PrefixString())
+	full, err := newPrefixFromApiStruct(&api.Prefix{RtcPrefix: "65000:65000:100/96", MaskLengthMin: 96, MaskLengthMax: 96})
+	assert.NoError(t, err)
+	assert.True(t, p.Prefix.Contains(full.Prefix.Addr()))
 }

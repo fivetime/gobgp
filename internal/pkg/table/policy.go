@@ -16,6 +16,7 @@
 package table
 
 import (
+	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -23,6 +24,7 @@ import (
 	"net/netip"
 	"reflect"
 	"regexp"
+	"regexp/syntax"
 	"slices"
 	"sort"
 	"strconv"
@@ -306,17 +308,24 @@ func (lhs *Prefix) Equal(rhs *Prefix) bool {
 }
 
 func (p *Prefix) PrefixString() string {
+	if p.AddressFamily == bgp.RF_RTC_UC {
+		b := p.Prefix.Addr().As16()
+		as := binary.BigEndian.Uint32(b[:4])
+		rt, err := bgp.ParseExtended(b[4:12])
+		if err != nil {
+			return p.Prefix.String()
+		}
+		return fmt.Sprintf("%d:%s/%d", as, rt.String(), p.Prefix.Bits())
+	}
 	return p.Prefix.String()
 }
 
 var _regexpPrefixRange = regexp.MustCompile(`(\d+)\.\.(\d+)`)
 
 func NewPrefix(c oc.Prefix) (*Prefix, error) {
-	prefix := c.IpPrefix
-
-	rf := bgp.RF_IPv4_UC
-	if strings.Contains(c.IpPrefix.String(), ":") {
-		rf = bgp.RF_IPv6_UC
+	prefix, rf, err := c.ToPrefix()
+	if err != nil {
+		return nil, err
 	}
 	p := &Prefix{
 		Prefix:        prefix,
@@ -434,7 +443,13 @@ func (s *PrefixSet) ToConfig() *oc.PrefixSet {
 	list := make([]oc.Prefix, 0, s.tree.Size())
 	for _, ps := range s.tree.All() {
 		for _, p := range ps {
-			list = append(list, oc.Prefix{IpPrefix: netip.MustParsePrefix(p.PrefixString()), MasklengthRange: fmt.Sprintf("%d..%d", p.MasklengthRangeMin, p.MasklengthRangeMax)})
+			c := oc.Prefix{MasklengthRange: fmt.Sprintf("%d..%d", p.MasklengthRangeMin, p.MasklengthRangeMax)}
+			if p.AddressFamily == bgp.RF_RTC_UC {
+				c.RtcPrefix = p.PrefixString()
+			} else {
+				c.IpPrefix = netip.MustParsePrefix(p.PrefixString())
+			}
+			list = append(list, c)
 		}
 	}
 	return &oc.PrefixSet{
@@ -1173,8 +1188,19 @@ func scanLocalAdminBitmap(re *regexp.Regexp, asn uint16) *localAdminBitmap {
 	return bm
 }
 
+// hasTopLevelAlternation reports whether the outermost operator of the pattern
+// is an alternation. The leading ^<ASN>: then only describes the first branch,
+// so it says nothing about the communities the remaining branches accept.
+func hasTopLevelAlternation(s string) bool {
+	re, err := syntax.Parse(s, syntax.Perl)
+	if err != nil {
+		return true
+	}
+	return re.Op == syntax.OpAlternate
+}
+
 func extractLiteralASN(s string) (uint16, bool) {
-	if len(s) == 0 || s[0] != '^' {
+	if len(s) == 0 || s[0] != '^' || hasTopLevelAlternation(s) {
 		return 0, false
 	}
 	start := 1
@@ -1987,10 +2013,15 @@ func (c *PrefixCondition) Option() MatchOption {
 // subsequent comparison is skipped if that matches the conditions.
 // If PrefixList's length is zero, return true.
 func (c *PrefixCondition) Evaluate(path *Path, _ *PolicyOptions) bool {
-	pathAfi := path.GetFamily().Afi()
+	pathRf := path.GetFamily()
+	pathAfi := pathRf.Afi()
 	cAfi := c.set.family.Afi()
 
 	if cAfi != pathAfi {
+		return false
+	}
+	// RTC shares AFI_IP with IPv4-UC; only match RTC sets against RTC paths.
+	if bool(c.set.family == bgp.RF_RTC_UC) != bool(pathRf == bgp.RF_RTC_UC) {
 		return false
 	}
 
@@ -3863,6 +3894,18 @@ func (lhs *Policy) Add(rhs *Policy) error {
 }
 
 func (lhs *Policy) Remove(rhs *Policy) error {
+	for _, y := range rhs.Statements {
+		found := false
+		for _, x := range lhs.Statements {
+			if x.Name == y.Name {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return fmt.Errorf("not found statement %s in policy %s", y.Name, lhs.Name)
+		}
+	}
 	stmts := make([]*Statement, 0, len(lhs.Statements))
 	for _, x := range lhs.Statements {
 		found := false
@@ -4487,7 +4530,7 @@ func (r *RoutingPolicy) AddPolicy(x *Policy, refer bool) (err error) {
 	return err
 }
 
-func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []string) (err error) {
+func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool) (err error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -4499,9 +4542,11 @@ func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []s
 		err = fmt.Errorf("not found policy: %s", name)
 		return err
 	}
-	inUse := func(ids []string) bool {
-		for _, id := range ids {
-			for _, dir := range []PolicyDirection{POLICY_DIRECTION_EXPORT, POLICY_DIRECTION_EXPORT} {
+	// The assignment map holds the global RIB and the route server clients that
+	// still exist. An entry is removed when the peer goes away.
+	inUse := func() bool {
+		for id := range r.assignmentMap {
+			for _, dir := range []PolicyDirection{POLICY_DIRECTION_IMPORT, POLICY_DIRECTION_EXPORT} {
 				for _, y := range r.getPolicy(id, dir) {
 					if x.Name == y.Name {
 						return true
@@ -4513,7 +4558,7 @@ func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []s
 	}
 
 	if all {
-		if inUse(activeId) {
+		if inUse() {
 			err = fmt.Errorf("can't delete. policy %s is in use", name)
 			return err
 		}
@@ -4525,7 +4570,12 @@ func (r *RoutingPolicy) DeletePolicy(x *Policy, all, preserve bool, activeId []s
 		err = y.Remove(x)
 	}
 	if err == nil && !preserve {
-		for _, st := range y.Statements {
+		statements := x.Statements
+		if all {
+			statements = y.Statements
+		}
+
+		for _, st := range statements {
 			if !r.statementInUse(st) {
 				r.logger.Debug("delete unused statement",
 					slog.String("Topic", "Policy"),
@@ -4698,6 +4748,16 @@ func (r *RoutingPolicy) SetPeerPolicy(peerId string, c oc.ApplyPolicy) error {
 	return nil
 }
 
+// DeletePeerPolicy drops the policy assignment of a peer that is gone. Nothing
+// else removes an entry from the assignment map, so without this the map grows
+// every time a dynamic neighbor connects.
+func (r *RoutingPolicy) DeletePeerPolicy(peerId string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
+	delete(r.assignmentMap, peerId)
+}
+
 func (r *RoutingPolicy) Reset(rp *oc.RoutingPolicy, ap map[string]oc.ApplyPolicy) error {
 	if rp == nil {
 		return fmt.Errorf("routing Policy is nil in call to Reset")
@@ -4736,7 +4796,7 @@ func CanImportToVrf(v *Vrf, path *Path) bool {
 		if !isTransitiveType(x) {
 			continue
 		}
-		key, err := extCommRouteTargetKey(x)
+		key, err := bgp.ExtCommRouteTargetKey(x)
 		if err != nil {
 			continue
 		}

@@ -105,6 +105,11 @@ service GoBgpService {
   rpc ListBmp(ListBmpRequest) returns (stream ListBmpResponse);
 
   rpc SetLogLevel(SetLogLevelRequest) returns (SetLogLevelResponse);
+
+  rpc AddTcpAoKeychain(AddTcpAoKeychainRequest) returns (AddTcpAoKeychainResponse);
+  rpc UpdateTcpAoKeychain(UpdateTcpAoKeychainRequest) returns (UpdateTcpAoKeychainResponse);
+  rpc DeleteTcpAoKeychain(DeleteTcpAoKeychainRequest) returns (DeleteTcpAoKeychainResponse);
+  rpc ListTcpAoKeychain(ListTcpAoKeychainRequest) returns (stream ListTcpAoKeychainResponse);
 }
 
 message StartBgpRequest {
@@ -704,6 +709,7 @@ message Peer {
   repeated AfiSafi afi_safis = 10;
   TtlSecurity ttl_security = 11;
   BfdPeerConfig bfd = 12;
+  TcpAoPeerConfig tcp_ao = 13;
 }
 
 message PeerGroup {
@@ -719,6 +725,7 @@ message PeerGroup {
   repeated AfiSafi afi_safis = 10;
   TtlSecurity ttl_security = 11;
   BfdPeerConfig bfd = 12;
+  TcpAoPeerConfig tcp_ao = 13;
 }
 
 message DynamicNeighbor {
@@ -869,6 +876,7 @@ message PeerState {
   DisconnectReason disconnect_reason = 21;
   string disconnect_message = 22;
   BfdPeerState bfd_state = 23;
+  TcpAoPeerState tcp_ao_state = 24;
 }
 
 message Messages {
@@ -1119,6 +1127,7 @@ message AddPaths {
 
 message Prefix {
   string ip_prefix = 1;
+  string rtc_prefix = 4;
   uint32 mask_length_min = 2;
   uint32 mask_length_max = 3;
 }
@@ -1441,4 +1450,76 @@ message BfdState {
   uint64 received_error = 3;
   uint64 invalid_packet = 4;
   uint64 unknown_peer = 5;
+}
+
+enum TcpAoAlgorithm {
+  TCP_AO_ALGORITHM_UNSPECIFIED = 0;
+  TCP_AO_ALGORITHM_HMAC_SHA1_96 = 1;
+  TCP_AO_ALGORITHM_AES_128_CMAC_96 = 2;
+  TCP_AO_ALGORITHM_HMAC_SHA256_96 = 3;
+  TCP_AO_ALGORITHM_HMAC_SHA256_128 = 4;
+}
+
+message TcpAoKey {
+  uint32 send_id = 1;
+  uint32 receive_id = 2;
+  TcpAoAlgorithm algorithm = 3;
+  bytes master_key = 4 [debug_redact = true]; // write-only
+  bool exclude_tcp_options = 5;
+}
+
+message TcpAoKeychain {
+  string name = 1;
+  repeated TcpAoKey keys = 2;
+}
+
+message AddTcpAoKeychainRequest {
+  TcpAoKeychain keychain = 1;
+}
+
+message AddTcpAoKeychainResponse {}
+
+message UpdateTcpAoKeychainRequest {
+  string name = 1;
+  repeated TcpAoKey add_keys = 2;
+  repeated TcpAoKey delete_keys = 3; // only send_id and receive_id are used
+}
+
+message UpdateTcpAoKeychainResponse {
+  TcpAoKeychain keychain = 1;
+}
+
+message DeleteTcpAoKeychainRequest {
+  string name = 1;
+}
+
+message DeleteTcpAoKeychainResponse {}
+
+message ListTcpAoKeychainRequest {
+  string name = 1;
+}
+
+message ListTcpAoKeychainResponse {
+  TcpAoKeychain keychain = 1;
+}
+
+message TcpAoPeerConfig {
+  string keychain = 1;
+  uint32 send_id = 2;
+}
+
+message TcpAoPeerState {
+  repeated TcpAoKeyState keys = 1;
+  uint64 packets_key_not_found = 2;
+  uint64 packets_ao_required = 3;
+  uint64 packets_dropped_icmp = 4;
+}
+
+message TcpAoKeyState {
+  uint32 send_id = 1;
+  uint32 receive_id = 2;
+  bool current = 3;
+  bool receive_next = 4;
+  uint64 packets_good = 5;
+  uint64 packets_bad = 6;
 }
